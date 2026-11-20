@@ -12,8 +12,8 @@ TOOLS: list[dict] = [
     {
         "name": "get_financials",
         "description": (
-            "Annual financials from SEC XBRL filings. Returns one row per fiscal year with value, unit, "
-            "period_end and a `source` id to cite. Values are raw units (USD, not millions)."
+            "Annual financials from SEC XBRL filings (US-GAAP 10-K, or IFRS 20-F/40-F for foreign filers; see `currency`). Returns one row per fiscal year with value, unit, "
+            "period_end and a `source` id to cite. Values are raw units in the reporting currency (not millions)."
         ),
         "input_schema": {
             "type": "object",

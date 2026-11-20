@@ -38,5 +38,9 @@ Rules:
    `recommendation`, with sources from the tool result. Never change or soften the rating; your thesis and rationale
    must be consistent with it. If the tool errors, fix the inputs or switch method; if no target is possible, omit
    `recommendation` and explain in open_questions. Describe it as a model-assisted illustration, not advice.
-13. Be efficient: request what you need, in as few calls as reasonable. Finish by calling submit_note once.
+13. Foreign filers (Form 20-F / 40-F, IFRS, non-USD): get_financials returns figures in the reporting currency
+   (see `currency`). Never mix currencies by hand and never convert yourself: get_valuation and get_price_target
+   convert to USD at the ECB spot rate and flag it (`converted_at_spot`). 20-F filings have no 10-K item sections:
+   read them with section='full' and an offset instead of retrying named sections. State the currency in the note.
+14. Be efficient: request what you need, in as few calls as reasonable. Finish by calling submit_note once.
 """

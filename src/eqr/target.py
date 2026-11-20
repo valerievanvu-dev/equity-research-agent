@@ -155,7 +155,7 @@ def get_price_target(ticker: str, peer_tickers: list[str], method: str, scenario
     sources = sorted(set(row.get("sources", [])))  # leaf ids only: the derived calc:valuation id adds nothing
     src_id = f"calc:target:{ticker}:{today.isoformat()}"
     return {
-        "ticker": ticker, "method": method, "growth_basis": GROWTH_BASIS[method], "horizon_months": horizon_months, "current_price": round(price, 2),
+        "ticker": ticker, "reporting_currency": row.get("reporting_currency", "USD"), "method": method, "growth_basis": GROWTH_BASIS[method], "horizon_months": horizon_months, "current_price": round(price, 2),
         "price_date": row.get("price_date"), "price_target": round(target, 2),
         "expected_price_return_pct": round(price_ret, 1), "dividend_yield_pct": round(div_yield, 1),
         "expected_total_return_pct": round(total, 1), "rating": rating_for(total), "rating_rule": RULE,

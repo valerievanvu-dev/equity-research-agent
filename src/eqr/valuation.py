@@ -12,7 +12,7 @@ import statistics as st
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-from . import comps, edgar, prices
+from . import comps, edgar, fx, prices
 
 MCAP_TOL = 0.10
 NOTES = [
@@ -26,15 +26,30 @@ NOTES = [
 MULTIPLES = ("ev_sales", "ev_ebit", "pe", "fcf_yield_pct")
 
 
-def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn) -> dict:
+def _to_usd(m: dict, ccy: str, rate: float) -> dict:
+    """Convert a company's monetary metrics from its reporting currency to USD at one spot rate."""
+    out = {}
+    for k, v in m.items():
+        if v["unit"] == ccy:
+            out[k] = {**v, "value": v["value"] * rate, "unit": "USD"}
+        elif v["unit"] == f"{ccy}/shares":
+            out[k] = {**v, "value": v["value"] * rate, "unit": "USD/shares"}
+        else:
+            out[k] = v  # percentages and other ratios are currency-neutral
+    return out
+
+
+def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn, fx_fn=fx.get_rate,
+         mcap_fn=prices.get_market_cap) -> dict:
     c = comps_fn(ticker, today)
     m = c["metrics"]
+    ccy = c.get("currency", "USD")
     sh = shares_fn(ticker)
     flags = list(price["flags"])
     row = {
         "ticker": ticker.upper(), "company": c["company"], "price": price["price"], "price_date": price["as_of"],
         "financials_period_end": c["period_end"], "shares": sh["shares"], "shares_as_of": sh["as_of"],
-        "metrics": {}, "flags": flags, "withheld": False,
+        "metrics": {}, "flags": flags, "withheld": False, "reporting_currency": ccy,
         "source": f"calc:valuation:{ticker.upper()}:{price['as_of'] or today.isoformat()}",
     }
     srcs = set(price["sources"]) | {sh["source"]}
@@ -50,8 +65,31 @@ def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn) -> dict:
         row["sources"] = sorted(srcs)
         return row
 
+    if ccy != "USD":  # price is in USD (US listing): put the financials in USD at today's spot rate
+        try:
+            rate = fx_fn(ccy, "USD", None)
+        except Exception as e:
+            flags.append(f"fx_unavailable:{ccy}:{type(e).__name__}")
+            row["withheld"] = True
+            row["sources"] = sorted(srcs)
+            return row
+        m = _to_usd(m, ccy, rate["rate"])
+        flags.append(f"converted_at_spot:{ccy}USD={rate['rate']:.4f}")
+        if rate["source"]:
+            srcs.add(rate["source"])
+
     mcap = price["price"] * sh["shares"]
     rep = price["market_cap_reported"]
+    if ccy != "USD" and not rep and mcap_fn:  # a dedicated, quote-verified market cap lookup, to check the ADR ratio
+        mc = mcap_fn(ticker, c["company"], today)
+        rep = mc.get("market_cap_usd")
+        srcs.update(mc.get("sources", []))
+        flags.extend(mc.get("flags", []))
+    if ccy != "USD" and not rep:  # without a market cap we cannot verify the ADR-to-share ratio
+        flags.append("adr_ratio_unverified")
+        row["withheld"] = True
+        row["sources"] = sorted(srcs)
+        return row
     if rep and abs(mcap / rep - 1) > MCAP_TOL:
         flags.append(f"market_cap_mismatch:implied={mcap:,.0f},page={rep:,.0f}")
         row["withheld"] = True
@@ -98,7 +136,8 @@ def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn) -> dict:
 
 
 def get_valuation(tickers: list[str], today: date | None = None, *, price_fn=prices.get_price,
-                  shares_fn=edgar.get_shares_outstanding, comps_fn=comps._company) -> dict:
+                  shares_fn=edgar.get_shares_outstanding, comps_fn=comps._company, fx_fn=fx.get_rate,
+                  mcap_fn=prices.get_market_cap) -> dict:
     today = today or date.today()
     names: dict[str, str] = {}
     errors: dict[str, str] = {}
@@ -112,7 +151,7 @@ def get_valuation(tickers: list[str], today: date | None = None, *, price_fn=pri
     rows = []
     for t in names:
         try:
-            rows.append(_row(t, today, price_futs[t].result(), shares_fn, comps_fn))
+            rows.append(_row(t, today, price_futs[t].result(), shares_fn, comps_fn, fx_fn, mcap_fn))
         except Exception as e:
             errors[t.upper()] = f"{type(e).__name__}: {e}"
     medians = {}
