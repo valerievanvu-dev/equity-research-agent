@@ -14,7 +14,7 @@ from typing import Callable, Iterator
 
 from . import edgar
 
-ID_RE = re.compile(r"(?:edgar|calc):[A-Za-z0-9_.:\-]+|web:https?://[^\s;,)\]`<>]+")
+ID_RE = re.compile(r"(?:edgar|calc|fx):[A-Za-z0-9_.:\-]+|web:https?://[^\s;,)\]`<>]+")
 
 
 def tool_calls(trace: dict) -> Iterator[tuple[str, dict, dict]]:
@@ -52,6 +52,8 @@ def _all_sources(obj) -> set[str]:
 @dataclass
 class Artifacts:
     company: str | None = None
+    currency: str = "USD"
+    taxonomy: str = "us-gaap"
     financials: dict[str, dict[int, dict]] = field(default_factory=dict)  # metric -> fiscal_year -> row
     comps: list[dict] = field(default_factory=list)
     comps_medians: dict = field(default_factory=dict)
@@ -77,6 +79,7 @@ def artifacts_from_trace(trace: dict) -> Artifacts:
     for name, _inp, res in tool_calls(trace):
         if name == "get_financials":
             a.company = res.get("company") or a.company
+            a.currency, a.taxonomy = res.get("currency", a.currency), res.get("taxonomy", a.taxonomy)
             for metric, rows in res.get("metrics", {}).items():
                 for r in rows:
                     a.financials.setdefault(metric, {})[r["fiscal_year"]] = r
@@ -151,6 +154,10 @@ class Refs:
         if key.startswith("filing:"):
             _, ticker, acc = key.split(":")
             return self.filing_info(ticker, acc)
+        if leaf.startswith("fx:"):  # fx:ecb:EURUSD:2026-11-19 -> the ECB reference-rate query that returned it
+            _, _, pair, d = leaf.split(":")
+            return (f"ECB reference rate {pair[:3]}/{pair[3:]} on {d} (via Frankfurter)",
+                    f"https://api.frankfurter.dev/v1/{d}?base={pair[:3]}&symbols={pair[3:]}")
         if leaf.startswith("web:"):
             url = leaf[4:]
             return self.titles.get(url) or urlparse(url).netloc or url, url

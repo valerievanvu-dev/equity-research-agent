@@ -38,7 +38,27 @@ METRICS: dict[str, tuple[str, list[str]]] = {
     "long_term_debt": ("instant", ["LongTermDebtNoncurrent", "LongTermDebt"]),
 }
 
-ANNUAL_FORMS = ("10-K", "10-K/A", "10-KT")
+# Foreign private issuers file 20-F / 40-F (usually IFRS, in their reporting currency) instead of the 10-K.
+ANNUAL_FORMS = ("10-K", "10-K/A", "10-KT", "20-F", "20-F/A", "40-F", "40-F/A")
+
+# Same friendly metric names, IFRS (ifrs-full) concepts. Used when a company has no US-GAAP revenue data.
+METRICS_IFRS: dict[str, tuple[str, list[str]]] = {
+    "revenue": ("duration", ["Revenue", "RevenueFromContractsWithCustomers"]),
+    "gross_profit": ("duration", ["GrossProfit"]),
+    "operating_income": ("duration", ["ProfitLossFromOperatingActivities"]),
+    "net_income": ("duration", ["ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]),
+    "eps_diluted": ("duration", ["DilutedEarningsLossPerShare"]),
+    "dps": ("duration", ["DividendsRecognisedAsDistributionsToOwnersPerShare"]),  # often absent: derived below
+    "operating_cash_flow": ("duration", ["CashFlowsFromUsedInOperatingActivities"]),
+    "capex": ("duration", ["PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"]),
+    "total_assets": ("instant", ["Assets"]),
+    "total_liabilities": ("instant", ["Liabilities"]),
+    "shareholders_equity": ("instant", ["EquityAttributableToOwnersOfParent", "Equity"]),
+    "cash": ("instant", ["CashAndCashEquivalents"]),
+    "long_term_debt": ("instant", ["NoncurrentPortionOfNoncurrentBondsIssued", "NoncurrentBorrowings"]),
+}
+DIVIDENDS_PAID_IFRS = ["DividendsPaidToEquityHoldersOfParentClassifiedAsFinancingActivities", "DividendsPaid"]
+WEIGHTED_SHARES_IFRS = ["WeightedAverageShares", "AdjustedWeightedAverageShares"]
 
 
 # ---------------------------------------------------------------- http + cache
@@ -111,20 +131,55 @@ def select_annual(entries: list[dict], kind: str) -> dict[int, dict]:
     return best
 
 
+def _currency(unit: str) -> str:
+    """'EUR' -> EUR, 'EUR/shares' -> EUR, 'USD' -> USD."""
+    return unit.split("/")[0].upper()
+
+
+def _derive_dps(ifrs: dict, years: int, ticker: str) -> list[dict]:
+    """Approximate dividends per share = cash dividends paid / weighted average shares, when no DPS concept exists."""
+    div = next((ifrs[c] for c in DIVIDENDS_PAID_IFRS if c in ifrs), None)
+    sh = next((ifrs[c] for c in WEIGHTED_SHARES_IFRS if c in ifrs), None)
+    if not div or not sh:
+        return []
+    div_by: dict[int, dict] = {}
+    for unit, entries in div["units"].items():
+        for fy, e in select_annual(entries, "duration").items():
+            div_by.setdefault(fy, {**e, "_unit": unit})
+    sh_by: dict[int, dict] = {}
+    for entries in sh["units"].values():
+        for fy, e in select_annual(entries, "duration").items():
+            sh_by.setdefault(fy, e)
+    rows = []
+    for fy in sorted(set(div_by) & set(sh_by), reverse=True)[:years]:
+        d, w = div_by[fy], sh_by[fy]
+        if not w["val"]:
+            continue
+        rows.append({"fiscal_year": fy, "period_end": d["end"], "value": abs(d["val"]) / w["val"],
+                     "unit": f"{_currency(d['_unit'])}/shares", "concept": "derived:cash_dividends_paid/weighted_shares",
+                     "source": f"edgar:facts:{ticker.upper()}:DividendsPaid:FY{fy}:{d['accn']}"})
+    return rows
+
+
 def get_financials(ticker: str, metrics: list[str] | None = None, years: int = 5) -> dict:
     cik, name = lookup(ticker)
-    facts = _fetch(
+    all_facts = _fetch(
         f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik10(cik)}.json",
         f"facts-{cik}.json",
         as_json=True,
-    )["facts"].get("us-gaap", {})
+    )["facts"]
+    us, ifrs = all_facts.get("us-gaap", {}), all_facts.get("ifrs-full", {})
+    # US-GAAP when the company reports it; otherwise IFRS (foreign private issuers filing 20-F / 40-F)
+    use_ifrs = bool(ifrs) and not any(c in us for c in METRICS["revenue"][1])
+    facts, spec = (ifrs, METRICS_IFRS) if use_ifrs else (us, METRICS)
     wanted = metrics or list(METRICS)
     out: dict[str, list[dict]] = {}
     missing: list[str] = []
+    notes: list[str] = []
     for m in wanted:
         if m not in METRICS:
             raise ValueError(f"Unknown metric '{m}'. Valid: {sorted(METRICS)}")
-        kind, concepts = METRICS[m]
+        kind, concepts = spec[m]
         by_fy: dict[int, dict] = {}
         for concept in concepts:
             node = facts.get(concept)
@@ -133,6 +188,12 @@ def get_financials(ticker: str, metrics: list[str] | None = None, years: int = 5
             for unit, entries in node["units"].items():
                 for fy, e in select_annual(entries, kind).items():
                     by_fy.setdefault(fy, {**e, "_unit": unit, "_concept": concept})
+        if not by_fy and use_ifrs and m == "dps":
+            derived = _derive_dps(ifrs, years, ticker)
+            if derived:
+                out[m] = derived
+                notes.append("dps is derived: cash dividends paid / weighted average shares (no per-share concept reported).")
+                continue
         if not by_fy:
             missing.append(m)
             continue
@@ -150,7 +211,12 @@ def get_financials(ticker: str, metrics: list[str] | None = None, years: int = 5
                 }
             )
         out[m] = rows
-    return {"ticker": ticker.upper(), "company": name, "metrics": out, "not_found": missing}
+    rev = out.get("revenue") or next(iter(out.values()), [])
+    currency = _currency(rev[0]["unit"]) if rev else "USD"
+    if use_ifrs:
+        notes.append(f"IFRS filer (Form 20-F/40-F): values are in {currency}, not USD.")
+    return {"ticker": ticker.upper(), "company": name, "taxonomy": "ifrs-full" if use_ifrs else "us-gaap",
+            "currency": currency, "metrics": out, "not_found": missing, "notes": notes}
 
 
 def get_shares_outstanding(ticker: str) -> dict:
@@ -180,9 +246,10 @@ def get_shares_outstanding(ticker: str) -> dict:
 def _shares_from_weighted_average(ticker: str, cik: int) -> dict:
     """Fallback for issuers (often dual-class) with no usable cover-page count: latest annual diluted
     weighted-average shares. Less current than the cover page, so callers must flag it."""
-    facts = _fetch(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik10(cik)}.json", f"facts-{cik}.json",
-                   as_json=True)["facts"].get("us-gaap", {})
-    node = facts.get("WeightedAverageNumberOfDilutedSharesOutstanding")
+    all_facts = _fetch(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{_cik10(cik)}.json", f"facts-{cik}.json",
+                       as_json=True)["facts"]
+    node = all_facts.get("us-gaap", {}).get("WeightedAverageNumberOfDilutedSharesOutstanding") or next(
+        (all_facts.get("ifrs-full", {})[c] for c in WEIGHTED_SHARES_IFRS if c in all_facts.get("ifrs-full", {})), None)
     if not node:
         raise ValueError("no cover-page or weighted-average share count in XBRL")
     best = None

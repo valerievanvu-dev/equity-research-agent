@@ -41,6 +41,7 @@ NOTES = [
     "Fiscal years are not calendar aligned. Compare using period_end, not fiscal-year labels.",
     "net_debt_proxy = long_term_debt - cash. It excludes current debt and lease liabilities.",
     "SEC 10-K filers only: leaders that file 20-F/40-F (e.g. L'Oreal, Shiseido, Beiersdorf, BAT, Imperial) are not covered.",
+    "Non-USD filers (IFRS, Form 20-F): operating comps stay in each company's reporting currency (see `currency`); percentages are currency-neutral. Valuation converts to USD at the ECB spot rate.",
     "Medians exclude stale rows (latest annual period older than 15 months).",
 ]
 NEEDED = ["revenue", "gross_profit", "operating_income", "net_income", "eps_diluted", "dps", "operating_cash_flow", "capex",
@@ -64,6 +65,7 @@ def _row_for(fin: dict, metric: str, fy: int) -> dict | None:
 
 def _company(ticker: str, today: date) -> dict:
     fin = edgar.get_financials(ticker, NEEDED, years=3)
+    ccy = fin.get("currency", "USD")  # reporting currency: EUR for an IFRS filer such as Unilever
     revs = sorted(fin["metrics"].get("revenue", []), key=lambda r: r["period_end"], reverse=True)
     if not revs:
         raise ValueError("no annual revenue found in XBRL")
@@ -76,9 +78,9 @@ def _company(ticker: str, today: date) -> dict:
         if value is not None and all(rows):
             metrics[name] = {"value": value, "unit": unit, "sources": [r["source"] for r in rows]}
 
-    put("revenue", cur["value"], "USD", [cur])
-    for name, unit in (("operating_income", "USD"), ("net_income", "USD"), ("eps_diluted", "USD/shares"),
-                       ("dps", "USD/shares")):
+    put("revenue", cur["value"], ccy, [cur])
+    for name, unit in (("operating_income", ccy), ("net_income", ccy), ("eps_diluted", f"{ccy}/shares"),
+                       ("dps", f"{ccy}/shares")):
         if pick[name]:
             put(name, pick[name]["value"], unit, [pick[name]])
     if len(revs) > 1:
@@ -93,21 +95,22 @@ def _company(ticker: str, today: date) -> dict:
     ocf, capex = pick["operating_cash_flow"], pick["capex"]
     if ocf and capex:
         fcf = ocf["value"] - capex["value"]
-        put("fcf", fcf, "USD", [ocf, capex])
+        put("fcf", fcf, ccy, [ocf, capex])
         put("fcf_margin_pct", _pct(fcf, cur["value"]), "percent", [ocf, capex, cur])
     ltd, cash = pick["long_term_debt"], pick["cash"]
     flags: list[str] = []
     if ltd and cash:
-        put("net_debt_proxy", ltd["value"] - cash["value"], "USD", [ltd, cash])
+        put("net_debt_proxy", ltd["value"] - cash["value"], ccy, [ltd, cash])
     elif cash and "long_term_debt" in fin["not_found"]:
         # No long-term-debt tag in ANY year: usually a debt-free filer, but absence is not proof. Assume zero, flag it.
-        put("net_debt_proxy", -cash["value"], "USD", [cash])
+        put("net_debt_proxy", -cash["value"], ccy, [cash])
         flags.append("debt_assumed_zero")
 
     stale = (today - date.fromisoformat(cur["period_end"])).days > STALE_DAYS
     return {
         "ticker": ticker.upper(),
         "company": fin["company"],
+        "currency": ccy,
         "fiscal_year_label": fy,
         "period_end": cur["period_end"],
         "stale": stale,

@@ -795,3 +795,220 @@ def test_uncertain_price_forces_low_conviction_in_the_target():
 
     r = get_price_target("AAA", ["P"], "pe", SCEN, valuation_fn=_val(flags=["price_uncertain:3.3%"]))
     assert r["conviction"] == "Low" and "price_uncertain:3.3%" in r["data_flags"]
+
+
+# ------------------------------------------------------------------ foreign (IFRS, 20-F) filers and currency
+def _fact(fy, val, form="20-F"):
+    return {"start": f"{fy}-01-01", "end": f"{fy}-12-31", "val": val, "fy": fy, "fp": "FY", "form": form,
+            "filed": f"{fy + 1}-02-01", "accn": f"0001-{fy % 100}-000001"}
+
+
+def _ifrs_facts():
+    return {"dei": {}, "ifrs-full": {
+        "Revenue": {"units": {"EUR": [_fact(2025, 1000), _fact(2024, 900)]}},
+        "ProfitLossFromOperatingActivities": {"units": {"EUR": [_fact(2025, 200), _fact(2024, 180)]}},
+        "DilutedEarningsLossPerShare": {"units": {"EUR/shares": [_fact(2025, 2.0), _fact(2024, 1.5)]}},
+        "DividendsPaidToEquityHoldersOfParentClassifiedAsFinancingActivities": {"units": {"EUR": [_fact(2025, -200), _fact(2024, -150)]}},
+        "WeightedAverageShares": {"units": {"shares": [_fact(2025, 100), _fact(2024, 100)]}},
+        "CashAndCashEquivalents": {"units": {"EUR": [{**_fact(2025, 300), "start": None}]}},
+    }}
+
+
+def test_ifrs_filer_is_read_in_its_reporting_currency_with_derived_dividend(monkeypatch):
+    from eqr import edgar
+
+    facts = _ifrs_facts()
+    monkeypatch.setattr(edgar, "lookup", lambda t: (123, "Foreign Co"))
+    monkeypatch.setattr(edgar, "_fetch", lambda *a, **k: {"facts": facts})
+    r = edgar.get_financials("FOR", ["revenue", "operating_income", "eps_diluted", "dps"], years=5)
+    assert r["taxonomy"] == "ifrs-full" and r["currency"] == "EUR"
+    assert [x["fiscal_year"] for x in r["metrics"]["revenue"]] == [2025, 2024] and r["metrics"]["revenue"][0]["unit"] == "EUR"
+    assert r["metrics"]["eps_diluted"][0]["unit"] == "EUR/shares"
+    dps = r["metrics"]["dps"][0]                                   # 200 cash dividends / 100 weighted shares, sign ignored
+    assert dps["value"] == 2.0 and dps["concept"].startswith("derived:") and dps["unit"] == "EUR/shares"
+    assert any("dps is derived" in n for n in r["notes"]) and any("not USD" in n for n in r["notes"])
+    # US-GAAP wins when the company reports it
+    facts["us-gaap"] = {"Revenues": {"units": {"USD": [_fact(2025, 5, form="10-K")]}}}
+    assert edgar.get_financials("FOR", ["revenue"])["taxonomy"] == "us-gaap"
+
+
+def test_shares_fall_back_to_ifrs_weighted_average(monkeypatch):
+    from eqr import edgar
+
+    monkeypatch.setattr(edgar, "lookup", lambda t: (123, "Foreign Co"))
+    monkeypatch.setattr(edgar, "_fetch", lambda *a, **k: {"facts": _ifrs_facts()})   # no dei cover-page count
+    sh = edgar.get_shares_outstanding("FOR")
+    assert sh["shares"] == 100.0 and sh["basis"] == "weighted_avg_diluted"
+
+
+def test_fx_rate_parsing_caching_and_failures(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from eqr import fx
+
+    monkeypatch.setattr(fx, "CACHE_DIR", tmp_path)
+    calls = []
+
+    def ok(url, timeout):
+        calls.append(url)
+        return NS(status_code=200, json=lambda: {"base": "EUR", "date": "2026-11-19", "rates": {"USD": 1.0992}})
+    r = fx.get_rate("eur", "usd", get=ok)
+    assert r["rate"] == 1.0992 and r["source"] == "fx:ecb:EURUSD:2026-11-19" and "base=EUR&symbols=USD" in r["url"]
+    fx.get_rate("EUR", "USD", get=ok)
+    assert len(calls) == 1                                          # second call served from cache
+    assert fx.get_rate("USD", "USD", get=ok)["rate"] == 1.0
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        fx.get_rate("XXX", "USD", get=lambda url, timeout: NS(status_code=404, json=lambda: {}))
+    with pytest.raises(RuntimeError, match="unusable"):
+        fx.get_rate("GBP", "USD", get=lambda url, timeout: NS(status_code=200, json=lambda: {"date": "2026-11-19", "rates": {"USD": 0}}))
+
+
+def _eur_comps(t, today=None):
+    srcs = lambda x: {"sources": [f"edgar:facts:F:{x}:FY2025:0001-25-000001"]}
+    return {"company": "Foreign Co", "period_end": "2025-12-31", "stale": False, "currency": "EUR", "flags": [], "metrics": {
+        "revenue": {"value": 1000.0, "unit": "EUR", **srcs("Revenue")},
+        "operating_income": {"value": 200.0, "unit": "EUR", **srcs("Op")},
+        "eps_diluted": {"value": 2.0, "unit": "EUR/shares", **srcs("Eps")},
+        "dps": {"value": 1.0, "unit": "EUR/shares", **srcs("Dps")},
+        "net_debt_proxy": {"value": 300.0, "unit": "EUR", **srcs("Debt")},
+        "fcf": {"value": 100.0, "unit": "EUR", **srcs("Fcf")},
+        "revenue_growth_pct": {"value": 5.0, "unit": "percent", **srcs("Rev")}}}
+
+
+def _fx_ok(base, quote, on=None):
+    return {"pair": "EURUSD", "rate": 1.2, "date": "2026-11-19", "source": "fx:ecb:EURUSD:2026-11-19", "url": "u"}
+
+
+def _no_mcap(*a, **k):
+    return {"market_cap_usd": None, "sources": [], "flags": ["mcap_not_verified"]}
+
+
+def _usd_price(mcap=2400.0, usable=True):
+    return {"price": 24.0, "as_of": "2026-11-19", "market_cap_reported": mcap, "sources": ["web:https://q.example/f"],
+            "flags": [], "usable": usable}
+
+
+def test_valuation_converts_foreign_financials_to_usd_at_spot(monkeypatch):
+    from datetime import date
+    from eqr import valuation as v
+
+    monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
+    shares = lambda t: {"shares": 100.0, "as_of": "2025-12-31", "multi_class": False, "basis": "cover_page", "source": "edgar:shares:F"}
+    out = v.get_valuation(["F"], date(2026, 11, 19), price_fn=lambda t, n, d: _usd_price(), shares_fn=shares,
+                          comps_fn=_eur_comps, fx_fn=_fx_ok, mcap_fn=_no_mcap)
+    row = out["rows"][0]
+    m = row["metrics"]
+    # EPS 2.0 EUR -> 2.4 USD, so P/E = 24 / 2.4 = 10.0 (a naive 24 / 2.0 = 12.0 would be wrong by the exchange rate)
+    assert m["pe"]["value"] == 10.0 and m["market_cap"]["value"] == 2400.0
+    assert m["enterprise_value"]["value"] == 2760.0                              # 2400 + 300 EUR * 1.2
+    assert m["ev_ebit"]["value"] == 11.5 and m["ev_sales"]["value"] == 2.3       # 2760 / 240, 2760 / 1200
+    assert any(f.startswith("converted_at_spot:EURUSD=1.2000") for f in row["flags"]) and not row["withheld"]
+    assert "fx:ecb:EURUSD:2026-11-19" in row["sources"] and row["reporting_currency"] == "EUR"
+    assert row["fundamentals"]["eps_diluted"] == 2.4 and row["fundamentals"]["dps"] == 1.2   # fundamentals feed the target in USD
+
+
+def test_foreign_valuation_is_withheld_when_it_cannot_be_verified(monkeypatch):
+    from datetime import date
+    from eqr import valuation as v
+
+    monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
+    shares = lambda t: {"shares": 100.0, "as_of": "x", "multi_class": False, "basis": "cover_page", "source": "edgar:shares:F"}
+
+    def run(price, fx_fn=_fx_ok, mcap_fn=_no_mcap):
+        return v.get_valuation(["F"], date(2026, 11, 19), price_fn=lambda t, n, d: price, shares_fn=shares,
+                               comps_fn=_eur_comps, fx_fn=fx_fn, mcap_fn=mcap_fn)["rows"][0]
+
+    no_cap = run(_usd_price(mcap=None))                                         # cannot verify the ADR-to-share ratio
+    assert no_cap["withheld"] and "adr_ratio_unverified" in no_cap["flags"] and not no_cap["metrics"]
+    adr2 = run(_usd_price(mcap=4800.0))                                         # page says 2x: one ADR = 0.5 shares, etc.
+    assert adr2["withheld"] and any(f.startswith("market_cap_mismatch") for f in adr2["flags"])
+
+    def boom(*a, **k):
+        raise RuntimeError("no FX rate")
+    nofx = run(_usd_price(), fx_fn=boom)
+    assert nofx["withheld"] and any(f.startswith("fx_unavailable:EUR") for f in nofx["flags"])
+
+
+def test_comps_keeps_reporting_currency_and_citations_resolve_fx(monkeypatch):
+    from datetime import date
+    from eqr import comps
+    from eqr.citations import Refs
+
+    fin = {"company": "Foreign Co", "currency": "EUR", "not_found": [], "metrics": {
+        "revenue": [{"fiscal_year": 2025, "period_end": "2025-12-31", "value": 1000, "unit": "EUR", "source": "s:rev25"},
+                    {"fiscal_year": 2024, "period_end": "2024-12-31", "value": 900, "unit": "EUR", "source": "s:rev24"}],
+        "eps_diluted": [{"fiscal_year": 2025, "period_end": "2025-12-31", "value": 2.0, "unit": "EUR/shares", "source": "s:eps"}]}}
+    monkeypatch.setattr(comps.edgar, "get_financials", lambda *a, **k: fin)
+    row = comps._company("F", date(2026, 3, 1))
+    assert row["currency"] == "EUR" and row["metrics"]["revenue"]["unit"] == "EUR" and row["metrics"]["eps_diluted"]["unit"] == "EUR/shares"
+    refs = Refs({}, {}, filing_info=lambda t, a: (f"{t} {a}", None))
+    refs.cite(["fx:ecb:EURUSD:2026-11-19"])
+    assert refs.items[0]["label"] == "ECB reference rate EUR/USD on 2026-11-19 (via Frankfurter)"
+    assert refs.items[0]["url"] == "https://api.frankfurter.dev/v1/2026-11-19?base=EUR&symbols=USD"
+
+
+def test_pdf_labels_the_reporting_currency_for_foreign_filers(tmp_path):
+    import json as _json
+    from pypdf import PdfReader
+    from eqr.pdf import build_pdf
+
+    tr = _fake_trace()
+    fin = _json.loads(tr["messages"][1]["content"][0]["content"])
+    fin["currency"], fin["taxonomy"] = "EUR", "ifrs-full"
+    tr["messages"][1]["content"][0]["content"] = _json.dumps(fin)
+    comps_res = _json.loads(tr["messages"][3]["content"][0]["content"])
+    comps_res["rows"][0]["currency"] = "EUR"
+    tr["messages"][3]["content"][0]["content"] = _json.dumps(comps_res)
+    note = ResearchNote(ticker="AAA", company="Alpha Co", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[])
+    out = build_pdf(note, tr, tmp_path / "eur.pdf", filing_info=lambda t, a: (f"{t} {a}", None))
+    text = "\n".join(p.extract_text() for p in PdfReader(str(out)).pages)
+    assert "€M" in text and "EUR, fiscal years" in text and "Ccy" in text
+    assert "not converted here" in text and "not comparable across currencies" in text
+
+
+def test_dedicated_market_cap_lets_a_foreign_row_through_and_catches_wrong_ratios(monkeypatch):
+    from datetime import date
+    from eqr import valuation as v
+
+    monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
+    shares = lambda t: {"shares": 100.0, "as_of": "x", "multi_class": False, "basis": "cover_page", "source": "edgar:shares:F"}
+    ok = lambda *a: {"market_cap_usd": 2400.0, "sources": ["web:https://mc.example/f"], "flags": []}
+    wrong = lambda *a: {"market_cap_usd": 12000.0, "sources": ["web:https://mc.example/f"], "flags": []}   # 5 shares per ADS
+
+    def run(mcap_fn):
+        return v.get_valuation(["F"], date(2026, 11, 19), price_fn=lambda t, n, d: _usd_price(mcap=None), shares_fn=shares,
+                               comps_fn=_eur_comps, fx_fn=_fx_ok, mcap_fn=mcap_fn)["rows"][0]
+    good = run(ok)
+    assert not good["withheld"] and good["metrics"]["pe"]["value"] == 10.0 and "web:https://mc.example/f" in good["sources"]
+    bad = run(wrong)
+    assert bad["withheld"] and any(f.startswith("market_cap_mismatch") for f in bad["flags"])
+
+
+def test_market_cap_extraction_is_verified_against_the_quote():
+    import json as _json
+    from datetime import date
+    from eqr import prices
+
+    page = "Unilever (UL) Market Cap 138.2B Revenue 51.0B"
+    search = lambda **kw: {"results": [{"url": "https://f.com/ul", "title": "", "publish_date": None, "excerpts": [page]},
+                                       {"url": "https://g.com/ul", "title": "", "publish_date": None, "excerpts": ["Market capitalization: $138,500,000,000"]}]}
+
+    def ext(cands):
+        return lambda m, s, u: _json.dumps({"candidates": cands})
+    two = prices.get_market_cap("UL", "Unilever", date(2026, 11, 19), search=search, extract=ext([
+        {"market_cap_usd": 138.2e9, "url": "https://f.com/ul", "quote": "Market Cap 138.2B"},
+        {"market_cap_usd": 138.5e9, "url": "https://g.com/ul", "quote": "Market capitalization: $138,500,000,000"}]))
+    assert two["market_cap_usd"] == pytest.approx(138.35e9) and len(two["sources"]) == 2 and two["flags"] == []
+    # invented figure, number not in the quote, quote not on the page, and unknown url are all rejected
+    for bad in ({"market_cap_usd": 200e9, "url": "https://f.com/ul", "quote": "Market Cap 138.2B"},
+                {"market_cap_usd": 51.0e9, "url": "https://f.com/ul", "quote": "Unilever (UL)"},
+                {"market_cap_usd": 99e9, "url": "https://f.com/ul", "quote": "Market Cap 99B"},
+                {"market_cap_usd": 138.2e9, "url": "https://evil.com/x", "quote": "Market Cap 138.2B"}):
+        r = prices.get_market_cap("UL", "Unilever", date(2026, 11, 19), search=search, extract=ext([bad]))
+        assert r["market_cap_usd"] is None and "mcap_not_verified" in r["flags"]
+    # two verified quotes that disagree by more than 5%: a real conflict, so no market cap is returned
+    pages = lambda **kw: {"results": [{"url": "https://f.com/ul", "title": "", "publish_date": None, "excerpts": ["Market Cap 138.2B"]},
+                                      {"url": "https://g.com/ul", "title": "", "publish_date": None, "excerpts": ["Market Cap 200.0B"]}]}
+    split = prices.get_market_cap("UL", "Unilever", date(2026, 11, 19), search=pages, extract=ext([
+        {"market_cap_usd": 138.2e9, "url": "https://f.com/ul", "quote": "Market Cap 138.2B"},
+        {"market_cap_usd": 200.0e9, "url": "https://g.com/ul", "quote": "Market Cap 200.0B"}]))
+    assert split["market_cap_usd"] is None and "mcap_conflict" in split["flags"]

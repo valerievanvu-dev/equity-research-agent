@@ -59,6 +59,13 @@ def marker(nums: list[int]) -> str:
     return f'<font size="7" color="#1F3A5F">[{",".join(map(str, nums))}]</font>' if nums else ""
 
 
+CCY_SYMBOL = {"USD": "$", "EUR": "\u20ac", "GBP": "\u00a3", "JPY": "\u00a5"}
+
+
+def sym(ccy: str) -> str:
+    return CCY_SYMBOL.get(ccy, f"{ccy} ")
+
+
 # ----------------------------------------------------------------------------- number formats
 def fm(v):  # USD -> $ millions
     return "n/a" if v is None else f"{v / 1e6:,.1f}"
@@ -122,14 +129,14 @@ def financial_table(a: Artifacts, refs: Refs, years: int = 5) -> list:
                 return rows[fy]["period_end"]
         return ""
 
-    header = ["USD, fiscal years"]
+    header = [f"{a.currency}, fiscal years"]
     for fy in fys:
         srcs = [r[fy]["source"] for r in a.financials.values() if fy in r]
         header.append(f"FY{fy}<br/>{safe(end(fy)[:7])} {marker(refs.cite(srcs))}")
     rows: list[list[str]] = []
     for key, label, fmt in FIN_ROWS:
         if key in a.financials:
-            rows.append([safe(label)] + [fmt(val(key, fy)) for fy in fys])
+            rows.append([safe(label.replace("$", sym(a.currency)))] + [fmt(val(key, fy)) for fy in fys])
     derived = []
 
     def ratio(num, den, fy):
@@ -144,7 +151,7 @@ def financial_table(a: Artifacts, refs: Refs, years: int = 5) -> list:
     derived.append(["Net margin"] + [fp(ratio("net_income", "revenue", fy)) for fy in fys])
     fcf = {fy: (None if val("operating_cash_flow", fy) is None or val("capex", fy) is None
                 else val("operating_cash_flow", fy) - val("capex", fy)) for fy in fys}
-    derived.append(["Free cash flow ($M)"] + [fm(fcf[fy]) for fy in fys])
+    derived.append([f"Free cash flow ({sym(a.currency)}M)"] + [fm(fcf[fy]) for fy in fys])
     derived.append(["FCF margin"] + [fp(None if fcf[fy] is None or not val("revenue", fy)
                                           else fcf[fy] / val("revenue", fy) * 100) for fy in fys])
     derived = [[safe(d[0])] + d[1:] for d in derived]
@@ -152,34 +159,40 @@ def financial_table(a: Artifacts, refs: Refs, years: int = 5) -> list:
     widths = [first] + [(525 - first) / len(fys)] * len(fys)
     n_raw = len(rows)
     t = make_table(header, rows + derived, widths, bold_rows=set(range(n_raw, n_raw + len(derived))) - set())
+    foreign = a.currency != "USD" or a.taxonomy != "us-gaap"
     note = Paragraph("Bold rows are derived in code from the reported figures above. Source: SEC XBRL company facts "
-                     "from each fiscal year's 10-K; [n] points to the filing.", SMALL)
+                     "from each fiscal year's annual report; [n] points to the filing."
+                     + (f" Figures are in {a.currency} as reported (IFRS, foreign filer) and are not converted here; "
+                        "the valuation tables convert to USD at the ECB spot rate." if foreign else ""), SMALL)
     return [t, Spacer(1, 3), note]
 
 
 def comps_table(a: Artifacts, refs: Refs, subject: str) -> list:
     if not a.comps:
         return [Paragraph("Peer comps were not retrieved in this run.", SMALL)]
-    header = ["Ticker", "Period end", "Revenue ($M)", "Growth", "Gross", "Operating", "Net", "FCF", "Net debt ($M)", "Refs"]
+    header = ["Ticker", "Period end", "Ccy", "Revenue (M)", "Growth", "Gross", "Operating", "Net", "FCF", "Net debt (M)", "Refs"]
     rows, bold = [], set()
     for i, r in enumerate(a.comps):
         if r["ticker"] == subject:
             bold.add(i)
         flag = " (stale)" if r.get("stale") else ""
-        rows.append([safe(r["ticker"]), safe(r["period_end"]) + safe(flag), fm(mv(r, "revenue")),
-                     fp(mv(r, "revenue_growth_pct")), fp(mv(r, "gross_margin_pct")), fp(mv(r, "operating_margin_pct")),
-                     fp(mv(r, "net_margin_pct")), fp(mv(r, "fcf_margin_pct")), fm(mv(r, "net_debt_proxy")),
-                     marker(refs.cite([r["source"]]))])
+        rows.append([safe(r["ticker"]), safe(r["period_end"]) + safe(flag), safe(r.get("currency", "USD")),
+                     fm(mv(r, "revenue")), fp(mv(r, "revenue_growth_pct")), fp(mv(r, "gross_margin_pct")),
+                     fp(mv(r, "operating_margin_pct")), fp(mv(r, "net_margin_pct")), fp(mv(r, "fcf_margin_pct")),
+                     fm(mv(r, "net_debt_proxy")), marker(refs.cite([r["source"]]))])
     if a.comps_calls == 1 and a.comps_medians:
         md = lambda k: (a.comps_medians.get(k) or {}).get("value")  # noqa: E731
-        rows.append(["Median", "", "", fp(md("revenue_growth_pct")), fp(md("gross_margin_pct")),
+        rows.append(["Median", "", "", "", fp(md("revenue_growth_pct")), fp(md("gross_margin_pct")),
                      fp(md("operating_margin_pct")), fp(md("net_margin_pct")), fp(md("fcf_margin_pct")), "", ""])
         bold.add(len(rows) - 1)
-    widths = [44, 66, 62, 44, 44, 52, 40, 40, 62, 71]
+    widths = [40, 62, 30, 58, 42, 42, 48, 36, 36, 58, 73]
+    mixed = len({r.get("currency", "USD") for r in a.comps}) > 1 or any(r.get("currency", "USD") != "USD" for r in a.comps)
     return [make_table(header, rows, widths, bold_rows=bold), Spacer(1, 3),
-            Paragraph("Percentages are of revenue. Net debt = long-term debt less cash (see notes). "
-                      "Fiscal year-ends differ; compare by period end. n/a = not reported in a standard XBRL tag, "
-                      "never zero. Subject company in bold.", SMALL)]
+            Paragraph("Percentages are of revenue and are currency-neutral. Revenue and net debt are in each company's "
+                      "reporting currency (Ccy), in millions" + ("; they are not converted and not comparable across currencies"
+                      if mixed else "") + ". Net debt = long-term debt less cash (see notes). Fiscal year-ends differ; "
+                      "compare by period end. n/a = not reported in a standard XBRL tag, never zero. Subject company in bold.",
+                      SMALL)]
 
 
 def valuation_table(a: Artifacts, refs: Refs, subject: str) -> list:

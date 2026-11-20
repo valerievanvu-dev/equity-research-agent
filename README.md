@@ -41,6 +41,24 @@ on unanchored multiples, few peers, wide scenario dispersion, an uncertain price
 web quotes: within 2% agree, 2-5% apart (delayed vs live) are used at the midpoint and flagged, wider is withheld.
 Output is a model-assisted illustration, not investment advice.
 
+## Foreign filers (IFRS, Form 20-F) and currency
+
+Companies like Unilever (UL) file a 20-F with IFRS figures in their own currency instead of a US-GAAP 10-K.
+- **Financials:** when a company has no US-GAAP revenue data, `get_financials` reads the IFRS (`ifrs-full`) concepts
+  from the same SEC data, in the reporting currency (`currency` in the result). 20-F and 40-F forms count as annual
+  reports. If a company reports no per-share dividend, DPS is *derived* (cash dividends paid / weighted average
+  shares) and labeled as such.
+- **Currency:** operating comps stay in each company's reporting currency (percentages are currency-neutral, the PDF
+  has a `Ccy` column). Valuation converts the financials to USD at the **ECB reference rate** (free Frankfurter API,
+  cached, no scraping) so a USD ADR price is never divided by euro earnings. The rate is cited like any source and
+  flagged `converted_at_spot:EURUSD=...`.
+- **ADR ratio guard:** the share count is for ordinary shares while the US price is per ADS. A foreign row is only
+  valued if a quote-verified **market cap** (a dedicated lookup) agrees with price x shares within 10%; otherwise it
+  is withheld (`adr_ratio_unverified` or `market_cap_mismatch`).
+- **Limits:** net debt for IFRS filers uses non-current bonds only (no other borrowings or leases); the 20-F text has
+  no 10-K item sections, so named-section reads fail and the agent pages the full document; only currencies in the
+  ECB set can be converted (otherwise `fx_unavailable` and the row is withheld).
+
 ## Engines and observability
 
 Everything runs on the **OpenAI Agents SDK** by default (`src/eqr/sdk_engine.py`). The hand-written loop
