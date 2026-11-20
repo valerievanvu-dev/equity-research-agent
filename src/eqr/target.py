@@ -8,6 +8,8 @@ This is a transparent illustration of a valuation method, not personalized inves
 Method (12-month horizon):
 - "pe":      target price = current EPS x (1 + growth) x target P/E
 - "ev_ebit": equity = EBIT x (1 + growth) x target EV/EBIT - net debt (held constant); price = equity / shares
+- "ev_sales": same with revenue x target EV/Sales, for loss-making or pre-profit companies. It ignores cash burn and
+             dilution, so these targets are always flagged low conviction.
 - price target = probability-weighted average of the three scenario prices (default 25% / 50% / 25%)
 - expected total return = (price target / price - 1) + last declared dividend per share / price
 """
@@ -19,13 +21,15 @@ from . import valuation
 
 BUY_AT, SELL_AT = 15.0, -10.0  # expected 12-month total return thresholds, in percent
 WEIGHTS = {"bear": 0.25, "base": 0.50, "bull": 0.25}
-MULTIPLE_BOUNDS = {"pe": (3.0, 60.0), "ev_ebit": (3.0, 40.0)}
-GROWTH_BOUNDS = (-60.0, 100.0)
+MULTIPLE_BOUNDS = {"pe": (3.0, 60.0), "ev_ebit": (3.0, 40.0), "ev_sales": (0.3, 40.0)}
+GROWTH_BOUNDS = {"pe": (-60.0, 100.0), "ev_ebit": (-60.0, 100.0), "ev_sales": (-60.0, 150.0)}
+GROWTH_BASIS = {"pe": "EPS", "ev_ebit": "EBIT", "ev_sales": "revenue"}
 RULE = (f"Buy if expected 12-month total return >= {BUY_AT:+.0f}%; Sell if <= {SELL_AT:+.0f}%; otherwise Hold. "
         "Total return = probability-weighted price target vs current price, plus the last declared dividend per "
         "share as a yield.")
-LOW_CONVICTION_FLAGS = {"multiple_not_anchored", "wide_dispersion", "dividend_unknown", "few_peers"}
-LOW_CONVICTION_ROW_PREFIXES = ("single_source", "stale_financials", "check_outlier", "shares_from_weighted")
+LOW_CONVICTION_FLAGS = {"multiple_not_anchored", "wide_dispersion", "dividend_unknown", "few_peers",
+                        "loss_making_revenue_multiple"}
+LOW_CONVICTION_ROW_PREFIXES = ("single_source", "stale_financials", "check_outlier", "shares_from_weighted", "price_uncertain")
 
 
 def rating_for(total_return_pct: float) -> str:
@@ -40,20 +44,22 @@ def implied_price(method: str, f: dict, growth_pct: float, multiple: float) -> f
     g = 1 + growth_pct / 100
     if method == "pe":
         return f["eps_diluted"] * g * multiple
-    return (f["operating_income"] * g * multiple - f["net_debt_proxy"]) / f["shares"]
+    base = f["operating_income"] if method == "ev_ebit" else f["revenue"]
+    return (base * g * multiple - f["net_debt_proxy"]) / f["shares"]
 
 
 def _check_fundamentals(method: str, f: dict) -> None:
     if method == "pe":
         if not f.get("eps_diluted") or f["eps_diluted"] <= 0:
-            raise ValueError("diluted EPS is missing or not positive: use method 'ev_ebit'")
-    else:
-        if not f.get("operating_income") or f["operating_income"] <= 0:
-            raise ValueError("operating income is missing or not positive: a multiple-based target is not meaningful")
-        if f.get("net_debt_proxy") is None:
-            raise ValueError("net debt is unavailable for this company: use method 'pe'")
-        if not f.get("shares"):
-            raise ValueError("share count unavailable")
+            raise ValueError("diluted EPS is missing or not positive: use method 'ev_sales' (or 'ev_ebit' if EBIT is positive)")
+        return
+    key, hint = ("operating_income", "use method 'ev_sales'") if method == "ev_ebit" else ("revenue", "no revenue multiple is possible")
+    if not f.get(key) or f[key] <= 0:
+        raise ValueError(f"{key} is missing or not positive: {hint}")
+    if f.get("net_debt_proxy") is None:
+        raise ValueError("net debt is unavailable for this company: use method 'pe' if EPS is positive")
+    if not f.get("shares"):
+        raise ValueError("share count unavailable")
 
 
 def _weights(scenarios: dict) -> dict[str, float]:
@@ -78,8 +84,9 @@ def get_price_target(ticker: str, peer_tickers: list[str], method: str, scenario
     weights = _weights(scenarios)
     lo_m, hi_m = MULTIPLE_BOUNDS[method]
     for name, sc in scenarios.items():
-        if not GROWTH_BOUNDS[0] <= float(sc["growth_pct"]) <= GROWTH_BOUNDS[1]:
-            raise ValueError(f"{name}: growth_pct must be between {GROWTH_BOUNDS[0]} and {GROWTH_BOUNDS[1]}")
+        glo, ghi = GROWTH_BOUNDS[method]
+        if not glo <= float(sc["growth_pct"]) <= ghi:
+            raise ValueError(f"{name}: growth_pct must be between {glo} and {ghi} for method '{method}'")
         if not lo_m <= float(sc["multiple"]) <= hi_m:
             raise ValueError(f"{name}: multiple must be between {lo_m} and {hi_m} for method '{method}'")
 
@@ -120,8 +127,11 @@ def get_price_target(ticker: str, peer_tickers: list[str], method: str, scenario
     flags: list[str] = []
     if anchors and all(abs(float(base["multiple"]) / a - 1) > 0.35 for a in anchors):
         flags.append("multiple_not_anchored")
-    if dps is None:
+    loss_making = (f.get("eps_diluted") or 0) <= 0 or (f.get("operating_income") or 0) <= 0
+    if dps is None and not loss_making:  # a loss-maker with no dividend data almost certainly pays none
         flags.append("dividend_unknown")
+    if method == "ev_sales" and loss_making:
+        flags.append("loss_making_revenue_multiple")
     if not med or med.get("n", 0) < 2:
         flags.append("few_peers")
     if (prices["bull"] - prices["bear"]) / price > 0.8:
@@ -145,7 +155,7 @@ def get_price_target(ticker: str, peer_tickers: list[str], method: str, scenario
     sources = sorted(set(row.get("sources", [])))  # leaf ids only: the derived calc:valuation id adds nothing
     src_id = f"calc:target:{ticker}:{today.isoformat()}"
     return {
-        "ticker": ticker, "method": method, "horizon_months": horizon_months, "current_price": round(price, 2),
+        "ticker": ticker, "method": method, "growth_basis": GROWTH_BASIS[method], "horizon_months": horizon_months, "current_price": round(price, 2),
         "price_date": row.get("price_date"), "price_target": round(target, 2),
         "expected_price_return_pct": round(price_ret, 1), "dividend_yield_pct": round(div_yield, 1),
         "expected_total_return_pct": round(total, 1), "rating": rating_for(total), "rating_rule": RULE,
@@ -154,7 +164,9 @@ def get_price_target(ticker: str, peer_tickers: list[str], method: str, scenario
                     "peers_in_median": med["n"] if med else 0},
         "fundamentals_used": {k: f.get(k) for k in ("eps_diluted", "operating_income", "net_debt_proxy", "dps", "shares")},
         "sensitivity": {"multiples": mults, "rows": grid}, "flags": flags, "data_flags": row_flags,
-        "notes": ["Growth is the change in EPS (pe) or EBIT (ev_ebit) from the latest fiscal year to the horizon.",
+        "notes": ["Growth is the change in EPS (pe), EBIT (ev_ebit) or revenue (ev_sales) from the latest fiscal year to the horizon.",
+                  *(["Revenue-multiple targets for loss-making companies ignore cash burn, funding needs and dilution: low conviction."]
+                    if method == "ev_sales" and loss_making else []),
                   "Net debt and share count are held constant; dividend yield uses the last declared dividend per share.",
                   "Probabilities and scenarios are the model's judgement; the rating is a fixed rule applied to them."],
         "source": src_id, "sources": [src_id] + sources,

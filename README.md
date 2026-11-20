@@ -23,6 +23,24 @@ tests/         offline unit tests (no key, no network)
 flags, bull/bear cases, and open questions. It is a demo of the format, **not investment advice**, and it was not audited.
 Every run saves its note to `reports/` (git-ignored) and its full trace to `runs/`.
 
+## Rating and price target
+
+The model proposes bear/base/bull scenarios (12-month growth and a target multiple) with evidence; **code** computes the
+implied prices, the probability-weighted price target, expected total return (price + dividend yield) and the rating by a
+fixed rule: **Buy >= +15%, Sell <= -10%, otherwise Hold** (`src/eqr/target.py`). The model cannot choose the rating, and a
+grader fails any note that differs from the computed result. Three methods, picked by what the company's numbers allow:
+
+| Method | Use when | Growth is on |
+|---|---|---|
+| `pe` | EPS is positive | EPS |
+| `ev_ebit` | EBIT is positive | EBIT |
+| `ev_sales` | loss-making or pre-profit | revenue |
+
+`ev_sales` ignores cash burn, funding needs and dilution, so it is **always flagged low conviction**. Conviction also drops
+on unanchored multiples, few peers, wide scenario dispersion, an uncertain price, or other data flags. Prices come from
+web quotes: within 2% agree, 2-5% apart (delayed vs live) are used at the midpoint and flagged, wider is withheld.
+Output is a model-assisted illustration, not investment advice.
+
 ## Engines and observability
 
 Everything runs on the **OpenAI Agents SDK** by default (`src/eqr/sdk_engine.py`). The hand-written loop

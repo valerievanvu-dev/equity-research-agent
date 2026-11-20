@@ -32,7 +32,8 @@ Rules:
 12. Recommendation: after get_valuation, call get_price_target ONCE with the same peers. Propose bear/base/bull
    scenarios (growth_pct over 12 months, target multiple) anchored in evidence: management guidance, MD&A trends,
    the subject's current multiple and the peer median. Bear must be genuinely worse than base, not a cosmetic tweak.
-   Pick method 'pe' if EPS is positive, else 'ev_ebit'. The tool computes the target and a FIXED-rule rating: copy
+   Pick method 'pe' if EPS is positive, else 'ev_ebit' if EBIT is positive, else 'ev_sales' (loss-making or
+   pre-profit companies: say plainly that a revenue multiple ignores cash burn and dilution, so conviction is Low). The tool computes the target and a FIXED-rule rating: copy
    rating, price_target, current_price, expected_total_return_pct, conviction, scenarios and flags EXACTLY into
    `recommendation`, with sources from the tool result. Never change or soften the rating; your thesis and rationale
    must be consistent with it. If the tool errors, fix the inputs or switch method; if no target is possible, omit
