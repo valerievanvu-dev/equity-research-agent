@@ -1,0 +1,47 @@
+"""The agent's output contract. Forcing structure is what makes grading possible."""
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class Metric(BaseModel):
+    name: str = Field(description="Canonical name, e.g. revenue, net_income, operating_margin")
+    period: str = Field(description="Fiscal period like FY2024")
+    value: float = Field(description="Raw units: USD not millions; percentages as 29.8 with unit 'percent'")
+    unit: str = Field(description="USD, USD/shares, or percent")
+    sources: list[str] = Field(min_length=1, description="Exact `source` strings from tool results this value came from")
+
+
+class Claim(BaseModel):
+    text: str
+    sources: list[str] = Field(min_length=1, description="Exact `source` strings supporting this claim")
+
+
+class CompsRow(BaseModel):
+    ticker: str
+    period_end: str = Field(description="Latest annual period end, YYYY-MM-DD, exactly as in get_comps")
+    metrics: dict[str, float] = Field(description="Copy values from get_comps exactly: revenue_growth_pct, gross_margin_pct, operating_margin_pct, ...")
+    sources: list[str] = Field(min_length=1, description="The row's `source` id from get_comps")
+
+
+class ValuationRow(BaseModel):
+    ticker: str
+    price_date: str | None = Field(default=None, description="Date of the price used, exactly as in get_valuation")
+    metrics: dict[str, float] = Field(description="Copy exactly from get_valuation: ev_sales, ev_ebit, pe, fcf_yield_pct, market_cap, ...")
+    flags: list[str] = Field(default_factory=list, description="Copy the row's flags")
+    sources: list[str] = Field(min_length=1, description="The row's `source` id and/or `sources` from get_valuation")
+
+
+class ResearchNote(BaseModel):
+    ticker: str
+    company: str
+    summary: str = Field(description="At most 3 sentences")
+    metrics: list[Metric]
+    thesis: str
+    bull_case: list[Claim]
+    bear_case: list[Claim]
+    key_risks: list[Claim]
+    comps: list[CompsRow] = Field(default_factory=list, description="Peer table: the subject company plus its peers, from get_comps")
+    valuation: list[ValuationRow] = Field(default_factory=list, description="Valuation multiples for subject and peers, from get_valuation")
+    peer_commentary: str = Field(default="", description="How the company ranks vs peers and why, citing the comps rows")
+    open_questions: list[str] = Field(default_factory=list, description="Data gaps or things you could not verify")

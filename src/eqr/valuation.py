@@ -1,0 +1,118 @@
+"""Valuation multiples: web price (guarded) x EDGAR shares, plus EDGAR fundamentals. All math in code.
+
+Honest limits, returned with every result:
+- Multiples use the latest FISCAL YEAR, not LTM, so they lag for companies with older year-ends.
+- EV = market cap + net_debt_proxy (long-term debt - cash). Excludes current debt, leases, minorities, preferred.
+- Price comes from web pages. A row whose price is conflicting/stale/unverified or whose implied market cap
+  disagrees with the page's market cap by >10% has its multiples withheld and is excluded from medians.
+"""
+from __future__ import annotations
+
+import statistics as st
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+
+from . import comps, edgar, prices
+
+MCAP_TOL = 0.10
+NOTES = [
+    "Multiples use the latest fiscal year (not LTM); companies with older year-ends are less current.",
+    "EV = market cap + net_debt_proxy (long-term debt - cash); excludes current debt, leases and minorities.",
+    "Prices come from web search with verbatim-quote verification; check `flags` before relying on a row.",
+    "debt_assumed_zero: no long-term-debt tag in any year, so net debt = -cash; excluded from EV-multiple medians.",
+    "check_outlier flags extreme multiples (often one-off items in the fiscal year): inspect before relying on them.",
+    "n/m means not meaningful (negative or zero earnings). Withheld rows are excluded from medians.",
+]
+MULTIPLES = ("ev_sales", "ev_ebit", "pe", "fcf_yield_pct")
+
+
+def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn) -> dict:
+    c = comps_fn(ticker, today)
+    m = c["metrics"]
+    sh = shares_fn(ticker)
+    flags = list(price["flags"])
+    row = {
+        "ticker": ticker.upper(), "company": c["company"], "price": price["price"], "price_date": price["as_of"],
+        "financials_period_end": c["period_end"], "shares": sh["shares"], "shares_as_of": sh["as_of"],
+        "metrics": {}, "flags": flags, "withheld": False,
+        "source": f"calc:valuation:{ticker.upper()}:{price['as_of'] or today.isoformat()}",
+    }
+    srcs = set(price["sources"]) | {sh["source"]}
+    if sh["multi_class"]:
+        flags.append("multi_class_shares_summed")
+    if sh.get("basis") != "cover_page":
+        flags.append("shares_from_weighted_avg_diluted")
+    flags.extend(c.get("flags", []))
+    if c["stale"]:
+        flags.append("stale_financials")
+    if not price["usable"]:
+        row["withheld"] = True
+        row["sources"] = sorted(srcs)
+        return row
+
+    mcap = price["price"] * sh["shares"]
+    rep = price["market_cap_reported"]
+    if rep and abs(mcap / rep - 1) > MCAP_TOL:
+        flags.append(f"market_cap_mismatch:implied={mcap:,.0f},page={rep:,.0f}")
+        row["withheld"] = True
+        row["sources"] = sorted(srcs)
+        return row
+
+    def put(name, value, unit, inputs):
+        if value is not None:
+            row["metrics"][name] = {"value": round(value, 2), "unit": unit}
+            for i in inputs:
+                srcs.update(m[i]["sources"])
+
+    put("market_cap", mcap, "USD", [])
+    nd = m.get("net_debt_proxy")
+    if nd is None:
+        flags.append("no_net_debt")
+    else:
+        ev = mcap + nd["value"]
+        put("enterprise_value", ev, "USD", ["net_debt_proxy"])
+        if "revenue" in m:
+            put("ev_sales", ev / m["revenue"]["value"], "x", ["net_debt_proxy", "revenue"])
+        oi = m.get("operating_income")
+        if oi and oi["value"] > 0:
+            put("ev_ebit", ev / oi["value"], "x", ["net_debt_proxy", "operating_income"])
+    eps = m.get("eps_diluted")
+    if eps and eps["value"] > 0:
+        put("pe", price["price"] / eps["value"], "x", ["eps_diluted"])
+    if "fcf" in m:
+        put("fcf_yield_pct", m["fcf"]["value"] / mcap * 100, "percent", ["fcf"])
+    for k, lo, hi in (("pe", 4, 150), ("ev_ebit", 3, 100), ("fcf_yield_pct", -50, 20)):
+        v = row["metrics"].get(k, {}).get("value")
+        if v is not None and not lo <= v <= hi:
+            flags.append(f"check_outlier:{k}={v}")  # not withheld: could be real (one-off gain, depressed earnings)
+    row["sources"] = sorted(srcs)
+    return row
+
+
+def get_valuation(tickers: list[str], today: date | None = None, *, price_fn=prices.get_price,
+                  shares_fn=edgar.get_shares_outstanding, comps_fn=comps._company) -> dict:
+    today = today or date.today()
+    names: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    for t in tickers:  # company names come from EDGAR; also fails fast on unknown tickers
+        try:
+            names[t] = edgar.lookup(t)[1]
+        except Exception as e:
+            errors[t.upper()] = f"{type(e).__name__}: {e}"
+    with ThreadPoolExecutor(4) as ex:  # prices are network-bound and independent
+        price_futs = {t: ex.submit(price_fn, t, names[t], today) for t in names}
+    rows = []
+    for t in names:
+        try:
+            rows.append(_row(t, today, price_futs[t].result(), shares_fn, comps_fn))
+        except Exception as e:
+            errors[t.upper()] = f"{type(e).__name__}: {e}"
+    medians = {}
+    for k in MULTIPLES:
+        used = [r for r in rows if not r["withheld"] and "stale_financials" not in r["flags"] and k in r["metrics"]
+                and not (k.startswith("ev_") and "debt_assumed_zero" in r["flags"])]
+        if used:
+            medians[k] = {"value": round(st.median(r["metrics"][k]["value"] for r in used), 2),
+                          "unit": used[0]["metrics"][k]["unit"], "n": len(used),
+                          "sources": sorted({s for r in used for s in r["sources"]})}
+    return {"rows": rows, "medians": medians, "errors": errors, "notes": NOTES}
