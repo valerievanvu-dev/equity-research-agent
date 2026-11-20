@@ -321,3 +321,15 @@ def test_majority_cluster_drops_a_stray_quote_but_two_way_split_conflicts():
     assert r["usable"] and r["price"] == 101.77 and "outlier_quote_dropped:1" in r["flags"]
     r2 = run([100.0, 104.0])
     assert not r2["usable"] and "price_conflict" in r2["flags"]
+
+
+def test_note_prose_is_html_unescaped_but_source_ids_are_not():
+    url_source = "web:https://x.com/a?x=1&amp;y=2"
+    n = ResearchNote(
+        ticker="X", company="X", summary="S&amp;P exposure", thesis="SG&amp;A rose; &lt;5% growth", metrics=[],
+        bull_case=[{"text": "R&amp;D up", "sources": [url_source]}], bear_case=[], key_risks=[],
+        peer_commentary="P&amp;G is bigger", open_questions=["A&amp;B unknown"])
+    assert n.summary == "S&P exposure" and n.thesis == "SG&A rose; <5% growth"
+    assert n.bull_case[0].text == "R&D up" and n.peer_commentary == "P&G is bigger"
+    assert n.open_questions == ["A&B unknown"]
+    assert n.bull_case[0].sources == [url_source]  # untouched, so it still matches the tool result

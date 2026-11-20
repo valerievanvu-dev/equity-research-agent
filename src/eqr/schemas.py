@@ -1,7 +1,15 @@
 """The agent's output contract. Forcing structure is what makes grading possible."""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import html
+
+from pydantic import BaseModel, Field, field_validator
+
+
+def _unescape(v):
+    """Models sometimes emit HTML-escaped prose ("SG&amp;A"). Decode it. Applied to prose fields ONLY: source ids
+    (URLs can legitimately contain '&amp;') must stay byte-for-byte so citation checks still match."""
+    return [html.unescape(x) for x in v] if isinstance(v, list) else html.unescape(v)
 
 
 class Metric(BaseModel):
@@ -15,6 +23,8 @@ class Metric(BaseModel):
 class Claim(BaseModel):
     text: str
     sources: list[str] = Field(min_length=1, description="Exact `source` strings supporting this claim")
+
+    _clean = field_validator("text")(_unescape)
 
 
 class CompsRow(BaseModel):
@@ -45,3 +55,5 @@ class ResearchNote(BaseModel):
     valuation: list[ValuationRow] = Field(default_factory=list, description="Valuation multiples for subject and peers, from get_valuation")
     peer_commentary: str = Field(default="", description="How the company ranks vs peers and why, citing the comps rows")
     open_questions: list[str] = Field(default_factory=list, description="Data gaps or things you could not verify")
+
+    _clean = field_validator("summary", "thesis", "peer_commentary", "open_questions")(_unescape)
