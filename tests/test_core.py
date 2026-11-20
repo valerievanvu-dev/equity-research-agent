@@ -447,3 +447,40 @@ def test_macos_mail_method_passes_args_safely_and_reports_failures(tmp_path):
         mailer.send_report(pdf, "s", "b", env=env, run=fake_run, platform="linux")
     with pytest.raises(mailer.NotConfigured, match="EQR_EMAIL_TO"):
         mailer.send_report(pdf, "s", "b", env={"EQR_EMAIL_METHOD": "macos-mail"}, run=fake_run, platform="darwin")
+
+
+def test_resend_method_payload_headers_and_errors(tmp_path):
+    import base64 as _b64
+    from types import SimpleNamespace as NS
+    from eqr import mailer
+
+    pdf = tmp_path / "r.pdf"
+    pdf.write_bytes(b"%PDF-1.4 resend test")
+    seen = {}
+
+    def ok(url, headers, json, timeout):
+        seen.update(url=url, headers=headers, body=json)
+        return NS(status_code=200, json=lambda: {"id": "abc"}, text="")
+
+    env = {"EQR_EMAIL_METHOD": "resend", "EQR_EMAIL_TO": "me@example.com", "RESEND_API_KEY": "re_secret123"}
+    assert mailer.send_report(pdf, "subj", "body", env=env, post=ok) == "me@example.com"
+    assert seen["url"] == "https://api.resend.com/emails"
+    assert seen["headers"]["Authorization"] == "Bearer re_secret123"
+    b = seen["body"]
+    assert b["to"] == ["me@example.com"] and b["subject"] == "subj" and "onboarding@resend.dev" in b["from"]
+    att = b["attachments"][0]
+    assert att["filename"] == "r.pdf" and _b64.b64decode(att["content"]) == pdf.read_bytes()
+
+    forbidden = lambda url, headers, json, timeout: NS(
+        status_code=403, text="", json=lambda: {"name": "validation_error", "message": "You can only send testing emails to your own email address."})
+    with pytest.raises(RuntimeError, match="403.*own email address") as e:
+        mailer.send_report(pdf, "s", "b", env=env, post=forbidden)
+    assert "re_secret123" not in str(e.value)  # the key must never leak into errors
+
+    junk = lambda url, headers, json, timeout: NS(status_code=500, text="boom", json=lambda: (_ for _ in ()).throw(ValueError()))
+    with pytest.raises(RuntimeError, match="500.*boom"):
+        mailer.send_report(pdf, "s", "b", env=env, post=junk)
+    for missing in ({"EQR_EMAIL_METHOD": "resend", "EQR_EMAIL_TO": "me@example.com"},
+                    {"EQR_EMAIL_METHOD": "resend", "RESEND_API_KEY": "k"}):
+        with pytest.raises(mailer.NotConfigured):
+            mailer.send_report(pdf, "s", "b", env=missing, post=ok)

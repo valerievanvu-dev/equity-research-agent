@@ -41,6 +41,18 @@ export EQR_SMTP_PASSWORD="app-password"       # for Gmail: an App Password, not 
 # optional: EQR_SMTP_HOST (default smtp.gmail.com), EQR_SMTP_PORT (default 587), EQR_EMAIL_FROM
 ```
 
+**Easiest: Resend** (HTTPS API, no Mail app, no SMTP login). Create a free account at resend.com, make an API key, then:
+
+```bash
+export EQR_EMAIL_METHOD="resend"
+export RESEND_API_KEY="re_..."
+export EQR_EMAIL_TO="the-email-you-signed-up-to-resend-with@example.com"
+```
+
+Resend's default test sender (`onboarding@resend.dev`) can only deliver to the address your Resend account was
+created with. To send to other recipients, verify a domain at resend.com/domains and set `EQR_EMAIL_FROM` to an
+address on it. Keep the key in your shell profile, never in the repo.
+
 **If your provider blocks App Passwords** (common on managed Google Workspace accounts), send through the Mail app
 on your Mac instead. No password is stored anywhere; the first run asks macOS to let Terminal control Mail:
 

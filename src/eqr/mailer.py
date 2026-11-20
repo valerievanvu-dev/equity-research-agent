@@ -1,8 +1,14 @@
-"""Email the PDF report. Two methods, chosen with EQR_EMAIL_METHOD. All settings come from environment variables,
+"""Email the PDF report. Three methods, chosen with EQR_EMAIL_METHOD. All settings come from environment variables,
 never from code or git.
 
     EQR_EMAIL_TO         recipient (required for both methods; if unset, email is skipped)
-    EQR_EMAIL_METHOD     "smtp" (default) or "macos-mail"
+    EQR_EMAIL_METHOD     "smtp" (default), "macos-mail", or "resend"
+
+  resend: HTTPS API, no Mail app and no SMTP login. Needs one API key.
+    RESEND_API_KEY       API key from resend.com
+    EQR_EMAIL_FROM       default "Equity Research Agent <onboarding@resend.dev>". Resend's test sender can only
+                         deliver to the email address your Resend account was created with; to send elsewhere,
+                         verify a domain at resend.com/domains and use an address on it.
 
   smtp:
     EQR_SMTP_USER        SMTP login (required)
@@ -17,6 +23,7 @@ never from code or git.
 """
 from __future__ import annotations
 
+import base64
 import os
 import smtplib
 import ssl
@@ -24,6 +31,8 @@ import subprocess
 import sys
 from email.message import EmailMessage
 from pathlib import Path
+
+import httpx
 
 
 class NotConfigured(Exception):
@@ -63,9 +72,38 @@ def _send_macos_mail(pdf_path: Path, subject: str, body: str, env, run, platform
     return to
 
 
+RESEND_URL = "https://api.resend.com/emails"
+RESEND_DEFAULT_FROM = "Equity Research Agent <onboarding@resend.dev>"
+
+
+def _send_resend(pdf_path: Path, subject: str, body: str, env, post) -> str:
+    to, key = env.get("EQR_EMAIL_TO"), env.get("RESEND_API_KEY")
+    missing = [n for n, v in (("EQR_EMAIL_TO", to), ("RESEND_API_KEY", key)) if not v]
+    if missing:
+        raise NotConfigured(f"set {', '.join(missing)} to enable emailing (see README)")
+    pdf = Path(pdf_path)
+    payload = {
+        "from": env.get("EQR_EMAIL_FROM", RESEND_DEFAULT_FROM), "to": [to], "subject": subject, "text": body,
+        "attachments": [{"filename": pdf.name, "content": base64.b64encode(pdf.read_bytes()).decode("ascii")}],
+    }
+    resp = post(RESEND_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload, timeout=60)
+    if resp.status_code >= 300:
+        try:  # error body field names are not guaranteed, so read defensively
+            data = resp.json()
+            detail = data.get("message") or data.get("error") or str(data)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Resend rejected the email (HTTP {resp.status_code}): {str(detail)[:300]}")
+    return to
+
+
 def send_report(pdf_path: Path, subject: str, body: str, env=os.environ, smtp_factory=None,
-                run=subprocess.run, platform: str = sys.platform) -> str:
-    if env.get("EQR_EMAIL_METHOD", "smtp").lower() in ("macos-mail", "mail", "applescript"):
+                run=subprocess.run, platform: str = sys.platform, post=httpx.post) -> str:
+    method = env.get("EQR_EMAIL_METHOD", "smtp").lower()
+    if method == "resend":
+        return _send_resend(pdf_path, subject, body, env, post)
+    if method in ("macos-mail", "mail", "applescript"):
         return _send_macos_mail(pdf_path, subject, body, env, run, platform)
 
     to, user, pw = env.get("EQR_EMAIL_TO"), env.get("EQR_SMTP_USER"), env.get("EQR_SMTP_PASSWORD")
