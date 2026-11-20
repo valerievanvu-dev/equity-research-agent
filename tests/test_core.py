@@ -319,8 +319,11 @@ def test_majority_cluster_drops_a_stray_quote_but_two_way_split_conflicts():
         return prices.get_price("X", "X", date(2026, 11, 19), search=search, extract=ext)
     r = run([101.77, 101.77, 104.04])
     assert r["usable"] and r["price"] == 101.77 and "outlier_quote_dropped:1" in r["flags"]
-    r2 = run([100.0, 104.0])
+    r2 = run([100.0, 110.0])            # 10% apart with no majority: a real conflict
     assert not r2["usable"] and "price_conflict" in r2["flags"]
+    r3 = run([199.20, 205.72])          # 3.2% of the midpoint apart, same day (delayed vs live quote): usable, midpoint, flagged
+    assert r3["usable"] and r3["price"] == 202.46 and any(f.startswith("price_uncertain:3.2") for f in r3["flags"])
+    assert "price_conflict" not in r3["flags"]
 
 
 def test_note_prose_is_html_unescaped_but_source_ids_are_not():
@@ -488,12 +491,12 @@ def test_resend_method_payload_headers_and_errors(tmp_path):
 
 # ------------------------------------------------------------------ price target and rating
 def _val(price=40.0, eps=4.0, dps=2.0, oi=1000.0, nd=2000.0, shares=100.0, pe=10.0, ev_ebit=9.0, withheld=False,
-         med_pe=11.0, med_n=3, flags=None):
+         med_pe=11.0, med_n=3, flags=None, rev=1000.0, ev_sales=2.0):
     row = {"ticker": "AAA", "price": price, "price_date": "2026-11-19", "withheld": withheld, "flags": flags or [],
            "source": "calc:valuation:AAA:2026-11-19", "sources": ["web:https://q.example/a", "edgar:facts:AAA:EPS:FY2025:0001-26-000001"],
-           "metrics": {"pe": {"value": pe}, "ev_ebit": {"value": ev_ebit}},
-           "fundamentals": {"eps_diluted": eps, "operating_income": oi, "net_debt_proxy": nd, "dps": dps, "shares": shares}}
-    medians = {"pe": {"value": med_pe, "n": med_n}, "ev_ebit": {"value": 9.5, "n": med_n}}
+           "metrics": {"pe": {"value": pe}, "ev_ebit": {"value": ev_ebit}, "ev_sales": {"value": ev_sales}},
+           "fundamentals": {"eps_diluted": eps, "operating_income": oi, "net_debt_proxy": nd, "dps": dps, "shares": shares, "revenue": rev}}
+    medians = {"pe": {"value": med_pe, "n": med_n}, "ev_ebit": {"value": 9.5, "n": med_n}, "ev_sales": {"value": 3.0, "n": med_n}}
     return lambda tickers, today=None: {"rows": [row], "medians": medians, "errors": {}}
 
 
@@ -710,3 +713,85 @@ def test_engine_dispatch_sdk_for_openai_models_loop_for_claude(monkeypatch):
         agent.run("t", ticker="X", model="claude-sonnet-5-5", trace_dir=None)
     with pytest.raises(Boom):                                                            # and --engine loop forces the loop
         agent.run("t", ticker="X", model="gpt-5.5", engine="loop", trace_dir=None)
+
+
+# ------------------------------------------------------------------ ev_sales for loss-making companies
+LOSS = dict(price=50.0, eps=-2.0, oi=-100.0, nd=-500.0, shares=100.0, dps=None, rev=1000.0, ev_sales=2.0)
+EVS = {"bear": {"growth_pct": 0, "multiple": 2, "rationale": "stalls"}, "base": {"growth_pct": 20, "multiple": 4, "rationale": "grows"},
+       "bull": {"growth_pct": 40, "multiple": 6, "rationale": "scales"}}
+
+
+def test_ev_sales_target_for_a_loss_maker_is_computed_and_low_conviction():
+    from eqr.target import get_price_target
+
+    r = get_price_target("AAA", ["P"], "ev_sales", EVS, valuation_fn=_val(**LOSS))
+    # (revenue*(1+g)*multiple - net debt)/shares with net cash of 500: 25.0 / 53.0 / 89.0 -> weighted 55.0
+    assert [s["price"] for s in r["scenarios"]] == [25.0, 53.0, 89.0] and r["price_target"] == 55.0
+    assert r["growth_basis"] == "revenue" and r["rating"] == "Hold" and r["expected_total_return_pct"] == 10.0
+    assert "loss_making_revenue_multiple" in r["flags"] and r["conviction"] == "Low"
+    assert "dividend_unknown" not in r["flags"]                     # a loss-maker with no dps data is not "unknown"
+    assert any("cash burn" in n for n in r["notes"])
+
+
+def test_ev_sales_guardrails_and_profitable_companies_are_not_forced_low_conviction():
+    import copy
+    from eqr.target import get_price_target
+
+    bad = copy.deepcopy(EVS); bad["bear"]["multiple"] = 0.1
+    with pytest.raises(ValueError, match="between 0.3"):
+        get_price_target("AAA", [], "ev_sales", bad, valuation_fn=_val(**LOSS))
+    fast = copy.deepcopy(EVS); fast["bull"]["growth_pct"] = 120      # allowed for revenue growth, not for EPS growth
+    assert get_price_target("AAA", [], "ev_sales", fast, valuation_fn=_val(**LOSS))["scenarios"][2]["growth_pct"] == 120
+    with pytest.raises(ValueError, match="growth_pct must be between"):
+        get_price_target("AAA", [], "pe", {**SCEN, "bull": {**SCEN["bull"], "growth_pct": 120}}, valuation_fn=_val())
+    with pytest.raises(ValueError, match="revenue is missing or not positive"):
+        get_price_target("AAA", [], "ev_sales", EVS, valuation_fn=_val(**{**LOSS, "rev": None}))
+    with pytest.raises(ValueError, match="use method 'ev_sales'"):                        # P/E on a loss-maker points to the fix
+        get_price_target("AAA", [], "pe", SCEN, valuation_fn=_val(**LOSS))
+    ok = get_price_target("AAA", [], "ev_sales", EVS, valuation_fn=_val(price=50.0, eps=4.0, oi=500.0, nd=-500.0, dps=1.0))
+    assert "loss_making_revenue_multiple" not in ok["flags"]       # profitable: the flag is for loss-makers only
+
+
+def test_pdf_labels_follow_the_valuation_method(tmp_path):
+    import json as _json
+    from datetime import date
+    from pypdf import PdfReader
+    from eqr.pdf import build_pdf
+    from eqr.target import get_price_target
+
+    res = get_price_target("AAA", ["P"], "ev_sales", EVS, today=date(2026, 11, 19), valuation_fn=_val(**LOSS))
+    trace = _fake_trace()
+    trace["messages"] += [{"role": "assistant", "content": [{"type": "tool_use", "id": "pt", "name": "get_price_target", "input": {}}]},
+                          {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "pt", "content": _json.dumps(res), "is_error": False}]}]
+    note = ResearchNote(ticker="AAA", company="Alpha Co", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[])
+    out = build_pdf(note, trace, tmp_path / "evs.pdf", filing_info=lambda t, a: (f"{t} {a}", None))
+    text = "\n".join(p.extract_text() for p in PdfReader(str(out)).pages)
+    assert "Revenue growth" in text and "Target EV/Sales" in text and "EV/SALES" in text and "Low" in text
+    assert "ignore cash burn" in text
+
+
+def test_price_guard_previous_day_corroborates_but_never_conflicts():
+    import json as _json
+    from datetime import date
+    from eqr import prices
+
+    def run(p_new, p_old):
+        search = lambda **kw: {"results": [
+            {"url": "https://a.com", "title": "", "publish_date": None, "excerpts": [f"price {p_new:.2f}"]},
+            {"url": "https://b.com", "title": "", "publish_date": None, "excerpts": [f"price {p_old:.2f}"]}]}
+        ext = lambda m, s, u: _json.dumps({"candidates": [
+            {"price": p_new, "as_of": "2026-11-18", "url": "https://a.com", "quote": f"price {p_new:.2f}"},
+            {"price": p_old, "as_of": "2026-11-17", "url": "https://b.com", "quote": f"price {p_old:.2f}"}]})
+        return prices.get_price("X", "X", date(2026, 11, 19), search=search, extract=ext)
+    volatile = run(196.79, 204.58)      # a 4% overnight move: yesterday's close is not a conflicting quote
+    assert volatile["usable"] and volatile["price"] == 196.79 and "single_source" in volatile["flags"]
+    assert "price_conflict" not in volatile["flags"]
+    agree = run(100.0, 100.8)           # roughly agrees: kept as corroboration, so not a single source
+    assert agree["usable"] and "single_source" not in agree["flags"] and len(agree["sources"]) == 2
+
+
+def test_uncertain_price_forces_low_conviction_in_the_target():
+    from eqr.target import get_price_target
+
+    r = get_price_target("AAA", ["P"], "pe", SCEN, valuation_fn=_val(flags=["price_uncertain:3.3%"]))
+    assert r["conviction"] == "Low" and "price_uncertain:3.3%" in r["data_flags"]

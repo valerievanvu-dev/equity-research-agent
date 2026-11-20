@@ -206,6 +206,7 @@ def valuation_table(a: Artifacts, refs: Refs, subject: str) -> list:
                       "(see references) and are verified in code, but treat flagged rows with caution.", SMALL)]
 
 
+METHOD_LABEL = {"pe": "P/E", "ev_ebit": "EV/EBIT", "ev_sales": "EV/SALES"}
 RATING_COLORS = {"Buy": colors.HexColor("#1B7F3B"), "Hold": colors.HexColor("#B7791F"), "Sell": colors.HexColor("#B42318")}
 
 
@@ -231,7 +232,7 @@ def recommendation_box(rec: dict, refs: Refs) -> Table:
           Paragraph(safe(rec.get("price_date") or ""), lab)],
          [Paragraph("EXPECTED TOTAL RETURN", lab), Paragraph(f"{rec['expected_total_return_pct']:+.1f}%", val),
           Paragraph(safe(split), lab)],
-         [Paragraph("METHOD / CONVICTION", lab), Paragraph(f"{safe(rec['method']).upper()} / {safe(rec.get('conviction', ''))}", val)]]]
+         [Paragraph("METHOD / CONVICTION", lab), Paragraph(f"{METHOD_LABEL.get(rec['method'], safe(rec['method']).upper())} / {safe(rec.get('conviction', ''))}", val)]]]
     t = Table(cells, colWidths=[84, 105, 100, 135, 101])
     t.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, 0), RATING_COLORS.get(rec["rating"], NAVY)),
                            ("BACKGROUND", (1, 0), (-1, 0), LIGHT), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -246,8 +247,8 @@ def target_section(a: Artifacts, note: ResearchNote, refs: Refs) -> list:
         return []
     out: list = [Paragraph("Price target and rating derivation", H2),
                  Paragraph(f"<b>Rating rule (fixed in code):</b> {safe(rec.get('rating_rule', 'see methodology'))}", BASE)]
-    unit = "EPS growth" if rec["method"] == "pe" else "EBIT growth"
-    mult = "Target P/E" if rec["method"] == "pe" else "Target EV/EBIT"
+    unit = {"pe": "EPS growth", "ev_ebit": "EBIT growth", "ev_sales": "Revenue growth"}.get(rec["method"], "Growth")
+    mult = {"pe": "Target P/E", "ev_ebit": "Target EV/EBIT", "ev_sales": "Target EV/Sales"}.get(rec["method"], "Target multiple")
     rows = [[safe(s["name"]).title(), f"{s['weight'] * 100:.0f}%", f"{s['growth_pct']:+.1f}%", f"{s['multiple']:.1f}x",
              f"${s['price']:,.2f}", f"{(s['price'] / rec['current_price'] - 1) * 100:+.1f}%"] for s in rec["scenarios"]]
     rows.append(["Probability-weighted target", "100%", "", "", f"${rec['price_target']:,.2f}",

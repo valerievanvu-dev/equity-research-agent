@@ -4,7 +4,9 @@ Guards (each one is a failure mode you can write an eval for):
 1. An LLM extracts candidate prices, but each must come with a `quote` that appears VERBATIM in the search
    excerpts and contains the number. This blocks invented prices.
 2. Candidates must come from URLs that were actually returned.
-3. If two or more sources disagree by more than 2%, the price is flagged as conflicting and not used.
+3. Sources within 2% agree. A stray source is dropped when a majority agree. With no majority, quotes 2-5% apart
+   are used at the midpoint but flagged `price_uncertain` (delayed vs live quotes on a volatile stock); wider than 5% is
+   a real conflict and the price is not used.
 4. A quote date older than 5 days marks the price stale and unusable; an unknown date is flagged.
 5. The page's reported market cap (if any) is returned so the caller can cross-check price x shares.
 """
@@ -23,6 +25,7 @@ EXTRACT_MODEL = os.environ.get("EQR_EXTRACT_MODEL", "gpt-5.4-mini")
 FIN_DOMAINS = ["finance.yahoo.com", "stockanalysis.com", "marketwatch.com", "investing.com", "nasdaq.com", "cnbc.com"]
 MAX_STALE_DAYS = 5
 CONFLICT_TOL = 0.02
+UNCERTAIN_TOL = 0.05  # same-day quotes 2-5% apart: usable at the midpoint but flagged; wider is a real conflict
 
 SYSTEM = """You extract stock price quotes from web search excerpts. Be literal and conservative.
 Return ONLY JSON: {"candidates": [{"price": number, "as_of": "YYYY-MM-DD" or null, "market_cap_usd": number or null,
@@ -87,7 +90,12 @@ def get_price(ticker: str, company: str, today: date | None = None, *, search=we
     dated = [(date.fromisoformat(c["as_of"]), c) for c in good if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c.get("as_of")))]
     if dated:
         anchor = max(d for d, _ in dated)
-        keep = [c for d, c in dated if (anchor - d).days <= 1]
+        latest = [c for d, c in dated if d == anchor]
+        ref = st.median(float(c["price"]) for c in latest)
+        # The previous day may corroborate the latest quote if it roughly agrees, but a different day's close can
+        # legitimately differ (a volatile stock moves several percent a day), so it is never counted as a conflict.
+        prev = [c for d, c in dated if (anchor - d).days == 1 and abs(float(c["price"]) / ref - 1) <= CONFLICT_TOL]
+        keep = latest + prev
         if len(keep) < len(good):
             out["flags"].append(f"older_or_undated_quotes_ignored:{len(good) - len(keep)}")
         out["as_of"] = anchor.isoformat()
@@ -98,7 +106,14 @@ def get_price(ticker: str, company: str, today: date | None = None, *, search=we
     # (one stray source is dropped and flagged); no majority means a real conflict.
     best = max(([c for c in good if abs(float(c["price"]) / float(a["price"]) - 1) <= CONFLICT_TOL] for a in good), key=len)
     conflict = len(good) > 1 and len(best) * 2 <= len(good)
-    if not conflict and len(best) < len(good):
+    uncertain = False
+    if conflict:
+        every = [float(c["price"]) for c in good]
+        spread = (max(every) - min(every)) / st.median(every)
+        if spread <= UNCERTAIN_TOL:
+            conflict, uncertain = False, True
+            out["flags"].append(f"price_uncertain:{spread * 100:.1f}%")
+    if not conflict and not uncertain and len(best) < len(good):
         out["flags"].append(f"outlier_quote_dropped:{len(good) - len(best)}")
         good = best
     prices = [float(c["price"]) for c in good]
