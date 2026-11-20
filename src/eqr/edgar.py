@@ -72,10 +72,11 @@ def _user_agent() -> str:
     return ua
 
 
-def _fetch(url: str, cache_name: str, *, as_json: bool):
+def _fetch(url: str, cache_name: str, *, as_json: bool, ttl_s: float | None = None):
+    """Disk-cached GET. ttl_s=None caches forever (filings never change); a number re-fetches when older than that."""
     global _last_call
     path = CACHE_DIR / cache_name
-    if path.exists():
+    if path.exists() and (ttl_s is None or time.time() - path.stat().st_mtime < ttl_s):
         raw = path.read_text()
         return json.loads(raw) if as_json else raw
     wait = MIN_INTERVAL - (time.time() - _last_call)
@@ -264,13 +265,14 @@ def _shares_from_weighted_average(ticker: str, cik: int) -> dict:
 
 
 # --------------------------------------------------------------------- filings
-def _submissions(cik: int) -> dict:
-    return _fetch(f"https://data.sec.gov/submissions/CIK{_cik10(cik)}.json", f"subs-{cik}.json", as_json=True)
+def _submissions(cik: int, ttl_s: float | None = None) -> dict:
+    return _fetch(f"https://data.sec.gov/submissions/CIK{_cik10(cik)}.json", f"subs-{cik}.json", as_json=True, ttl_s=ttl_s)
 
 
-def list_filings(ticker: str, form: str = "10-K", limit: int = 5) -> dict:
+def list_filings(ticker: str, form: str = "10-K", limit: int = 5, fresh_s: float | None = None) -> dict:
+    """fresh_s: re-fetch the filing index if the cached copy is older than this many seconds (the monitor uses it)."""
     cik, name = lookup(ticker)
-    recent = _submissions(cik)["filings"]["recent"]
+    recent = _submissions(cik, fresh_s)["filings"]["recent"]
     rows = []
     for i, f in enumerate(recent["form"]):
         if f == form:

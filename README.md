@@ -12,6 +12,7 @@ src/eqr/
   graders.py   deterministic graders; also usable as RL / rejection-sampling rewards
   comps.py     peer universes (beauty) + operating comps table computed in code from XBRL
   cli.py       `uv run eqr ELF`
+  track.py     `uv run eqr-track ...`: thesis, sector, watchlist, ideas, Buy list (thesis.py, sector.py, monitor.py, ideas.py, recommend.py)
 evals/         cases.jsonl + run.py (parallel, --repeat k)
 scripts/       export_sft.py (traces -> SFT), show_comps.py (comps table, no LLM), check_universe.py, find_concepts.py (debug XBRL tags)
 tests/         offline unit tests (no key, no network)
@@ -63,6 +64,37 @@ separately. A Buy whose note differs from the computed rating is an integrity fa
 Caveats: screening many names and keeping the Buys partly selects for the model's optimism and for noise, and nothing
 has tested whether these ratings predict returns. Every rating is appended to `data/ratings_history.jsonl` (git-ignored)
 so a later backtest can check what past Buys did. Research leads, not advice.
+
+## Tracking: thesis, sectors, watchlist, ideas, Buy list
+
+`eqr-track` turns one-off notes into an ongoing process. All of it is **code on SEC + price data, no model call** (only
+`ideas run --research` runs the full agent). State lives in `data/` (git-ignored; `EQR_DATA` moves it). Output is research
+leads, not personal advice: nothing knows your portfolio, risk or taxes, and nothing is sized.
+
+```bash
+uv run eqr-track thesis add ELF --pillar "operating_margin_pct >= 17"   # after `eqr ELF`; also created automatically per note
+uv run eqr-track thesis check                                          # Intact / Watch / Broken, with the failing pillars
+uv run eqr-track sector snapshot beauty                                # medians, cheap/rich vs median, change since last snapshot
+uv run eqr-track sector add cannabis TLRY CGC                          # your own sector
+uv run eqr-track watch add ELF --below 90 --above 140; uv run eqr-track watch run
+uv run eqr-track ideas run beauty tobacco --research 2                 # themed leads, optional full-agent runs on the top 2
+uv run eqr-track buys --refresh-prices                                 # the current, price-aware Buy list
+```
+
+- **Thesis tracker.** A note's thesis becomes *pillars*: a metric, an operator and a threshold. Seeds come from the note's own
+  numbers (growth may not halve, margin may not fall 3 pts, price may not fall 20% below entry); add your own with `--pillar`
+  (fails = **Broken**) or `--watch-pillar` (fails = **Watch**). Reaching the target price or a note older than 120 days is also
+  Watch. Missing data is shown as *unknown*, never as passing. Each check is appended to the thesis file to show drift.
+- **Sectors.** `snapshot` records the sector's median multiples/growth/margins (only rows that pass the screen's data checks) and
+  lists who is cheap or rich versus the median, who grows faster without a premium, and who is levered; re-running shows what changed
+  since the previous snapshot. Built-in sectors plus any you add.
+- **Monitor.** For each watchlist name: your price triggers, target reached, drawdown/run-up since the rating, a Buy that no longer
+  clears +15% at today's price, new 10-K/10-Q/8-K filings (the first check only sets a baseline), stale ratings, and thesis status.
+- **Ideas.** Stage-1 percentile signals are matched to themes (value, quality compounder, cash machine, growth at a discount); each idea
+  states its reason in numbers and its caveats, skips names already rated or watched, and goes into an inbox (`ideas list|dismiss|watch`).
+- **Buy list.** Re-prices each ticker's *latest* rating at today's price with the same fixed rule (target and dividend yield from the note):
+  Buy now / low conviction / wait for a dip (with the exact "buy below" price) / refresh the note first / review by hand.
+  Only the price is refreshed; if the price is not verified the logged price is used and marked `*`.
 
 ## Foreign filers (IFRS, Form 20-F) and currency
 

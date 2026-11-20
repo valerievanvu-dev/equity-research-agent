@@ -9,12 +9,15 @@ import json
 from datetime import date
 from pathlib import Path
 
+from . import store
 from .schemas import ResearchNote
 
-DEFAULT_PATH = Path("data/ratings_history.jsonl")
+
+def default_path() -> Path:
+    return store.data_dir() / "ratings_history.jsonl"
 
 
-def log_rating(note: ResearchNote, trace: dict, path: str | Path = DEFAULT_PATH, today: date | None = None) -> bool:
+def log_rating(note: ResearchNote, trace: dict, path: str | Path | None = None, today: date | None = None) -> bool:
     """Append one line per rated note. Returns False when the note has no recommendation."""
     rec = note.recommendation
     if rec is None:
@@ -27,8 +30,23 @@ def log_rating(note: ResearchNote, trace: dict, path: str | Path = DEFAULT_PATH,
         "flags": rec.flags, "run_id": trace.get("run_id"), "engine": trace.get("engine", "loop"),
         "model": trace.get("model"),
     }
-    path = Path(path)
+    path = Path(path) if path else default_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
         f.write(json.dumps(row) + "\n")
     return True
+
+
+def load(path: str | Path | None = None) -> list[dict]:
+    path = Path(path) if path else default_path()
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def latest_by_ticker(path: str | Path | None = None) -> dict[str, dict]:
+    """Most recent rating per ticker (a later Hold supersedes an earlier Buy). Same-day ties: the later line wins."""
+    out: dict[str, dict] = {}
+    for row in sorted(load(path), key=lambda r: r["date"]):  # stable sort keeps file order within a date
+        out[row["ticker"]] = row
+    return out
