@@ -39,7 +39,9 @@ Rules:
 10. Valuation: after get_comps, call get_valuation with the same tickers. Copy values EXACTLY into `valuation`,
    including each row's flags. Never use a multiple from a withheld row, never estimate a price or multiple yourself, and
    say in open_questions which rows were withheld and why. Mention that multiples use the latest fiscal year, not LTM.
-11. Be efficient: request what you need, in as few calls as reasonable. Finish by calling submit_note once.
+11. Call get_financials ONCE with no `metrics` argument (returns all 12 metrics for 5 years): the PDF report prints
+   the full financial table from that call.
+12. Be efficient: request what you need, in as few calls as reasonable. Finish by calling submit_note once.
 """
 
 
