@@ -88,10 +88,11 @@ def main() -> None:
     ap.add_argument("--model")
     ap.add_argument("--max-turns", type=int, default=15)
     ap.add_argument("--no-email", action="store_true", help="build the PDF but do not email it")
+    ap.add_argument("--engine", choices=["sdk", "loop"], help="sdk = OpenAI Agents SDK with tracing (default); loop = hand-written loop")
     args = ap.parse_args()
 
     res = run((args.task or DEFAULT_TASK).format(ticker=args.ticker.upper()), ticker=args.ticker.upper(),
-              model=args.model, max_turns=args.max_turns)
+              model=args.model, max_turns=args.max_turns, engine=args.engine)
     if res.note:
         md = render(res.note)
         print(md)
@@ -103,5 +104,7 @@ def main() -> None:
     else:
         print(f"FAILED: {res.error}")
     t = res.trace
-    print(f"\n[{t['turns']} turns, {t['usage']['input_tokens']} in / {t['usage']['output_tokens']} out tokens, "
+    if t.get("trace_url"):
+        print(f"\nobservability (OpenAI Traces): {t['trace_url']}")
+    print(f"\n[{t.get('engine', 'loop')} engine, {t['turns']} turns, {t['usage']['input_tokens']} in / {t['usage']['output_tokens']} out tokens, "
           f"{t['wall_s']}s] trace: {res.trace_path}")

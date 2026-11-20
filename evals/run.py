@@ -18,8 +18,8 @@ from eqr.judge import judge
 ROOT = Path(__file__).parent
 
 
-def run_case(case: dict, model: str | None, rep: int, judge_model: str | None) -> dict:
-    res = run(case["task"], ticker=case["ticker"], model=model, meta={"case_id": case["id"], "rep": rep})
+def run_case(case: dict, model: str | None, rep: int, judge_model: str | None, engine: str | None = None) -> dict:
+    res = run(case["task"], ticker=case["ticker"], model=model, engine=engine, meta={"case_id": case["id"], "rep": rep})
     g = grade(case, res.note, res.trace)
     jr = None
     if judge_model and res.note:
@@ -47,6 +47,7 @@ def main() -> None:
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--only", help="substring filter on case id")
+    ap.add_argument("--engine", choices=["sdk", "loop"], help="compare engines: sdk (default) vs the hand-written loop")
     ap.add_argument("--judge", nargs="?", const="default", metavar="MODEL",
                     help="also run the LLM judge (default model: EQR_JUDGE_MODEL). Reported separately from pass/fail.")
     args = ap.parse_args()
@@ -59,7 +60,7 @@ def main() -> None:
     jobs = [(c, r) for c in cases for r in range(args.repeat)]
 
     with ThreadPoolExecutor(args.workers) as ex:
-        rows = list(ex.map(lambda j: run_case(j[0], args.model, j[1], judge_model), jobs))
+        rows = list(ex.map(lambda j: run_case(j[0], args.model, j[1], judge_model, args.engine), jobs))
 
     print(f"\n{'case':34} {'rep':>3} {'acc':>5} {'cite':>5} {'pass':>5} {'turns':>5} {'tokens':>7} {'judge':>6}")
     for r in rows:

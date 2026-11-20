@@ -23,6 +23,21 @@ tests/         offline unit tests (no key, no network)
 flags, bull/bear cases, and open questions. It is a demo of the format, **not investment advice**, and it was not audited.
 Every run saves its note to `reports/` (git-ignored) and its full trace to `runs/`.
 
+## Engines and observability
+
+Everything runs on the **OpenAI Agents SDK** by default (`src/eqr/sdk_engine.py`). The hand-written loop
+(`src/eqr/agent.py`) is kept as `--engine loop` and is used automatically for Claude models, since the SDK path is
+OpenAI-only. Both write the same canonical trace JSON, so graders, the judge, the PDF and the SFT export work on either.
+Compare them on the same evals: `uv run python evals/run.py --engine loop` vs `--engine sdk`.
+
+- **Observability:** each SDK run is traced to the [OpenAI Traces dashboard](https://platform.openai.com/traces)
+  (every model call, tool call with inputs and outputs, timings, tokens). The CLI prints the link, and it is stored as
+  `trace_url` in `runs/<run>.json`. Sign in with the account that owns `OPENAI_API_KEY`.
+- **What is uploaded:** prompts, tool inputs and outputs (SEC data, web excerpts, the note) go to the OpenAI platform
+  under your organisation. Set `EQR_TRACING=off` to disable it. Local `runs/*.json` traces are always written.
+- Our tools and JSON schemas are defined once and used by both engines. A custom finish rule ends an SDK run only when
+  `submit_note` was accepted, so an invalid note is sent back to the model to repair.
+
 ## PDF report and email
 
 Every run also writes `reports/<TICKER>-<date>.pdf` and, if email is configured, sends it to you. The PDF has the
