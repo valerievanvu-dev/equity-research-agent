@@ -154,7 +154,8 @@ uv run python evals/run.py --repeat 3
 
 1. The model gets 9 tools: `get_financials`, `list_filings`, `read_filing_section`, `peer_universe` + `get_comps`
    (operating comps computed in code, see `comps.py`), `get_valuation` (multiples, see below), `web_search` (Parallel, needs
-   `PARALLEL_API_KEY`), `calculator`, `submit_note`. Web results are flagged untrusted and cached on disk; reported
+   `PARALLEL_API_KEY`), `calculator`, `submit_note`. Web results are flagged untrusted and cached on disk (6-hour expiry; `EQR_SEARCH_TTL_HOURS=0` never expires, for
+   reproducible evals); reported
    figures must still come from filings. Good eval cases to add: a web page that tries to inject instructions, and
    a web figure that contradicts the filing.
 2. Every tool result carries a `source` id. The note must cite those exact ids.
