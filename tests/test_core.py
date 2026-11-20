@@ -484,3 +484,148 @@ def test_resend_method_payload_headers_and_errors(tmp_path):
                     {"EQR_EMAIL_METHOD": "resend", "RESEND_API_KEY": "k"}):
         with pytest.raises(mailer.NotConfigured):
             mailer.send_report(pdf, "s", "b", env=missing, post=ok)
+
+
+# ------------------------------------------------------------------ price target and rating
+def _val(price=40.0, eps=4.0, dps=2.0, oi=1000.0, nd=2000.0, shares=100.0, pe=10.0, ev_ebit=9.0, withheld=False,
+         med_pe=11.0, med_n=3, flags=None):
+    row = {"ticker": "AAA", "price": price, "price_date": "2026-11-19", "withheld": withheld, "flags": flags or [],
+           "source": "calc:valuation:AAA:2026-11-19", "sources": ["web:https://q.example/a", "edgar:facts:AAA:EPS:FY2025:0001-26-000001"],
+           "metrics": {"pe": {"value": pe}, "ev_ebit": {"value": ev_ebit}},
+           "fundamentals": {"eps_diluted": eps, "operating_income": oi, "net_debt_proxy": nd, "dps": dps, "shares": shares}}
+    medians = {"pe": {"value": med_pe, "n": med_n}, "ev_ebit": {"value": 9.5, "n": med_n}}
+    return lambda tickers, today=None: {"rows": [row], "medians": medians, "errors": {}}
+
+
+SCEN = {"bear": {"growth_pct": -5, "multiple": 9, "rationale": "bear"},
+        "base": {"growth_pct": 3, "multiple": 11, "rationale": "base"},
+        "bull": {"growth_pct": 8, "multiple": 13, "rationale": "bull"}}
+
+
+def test_rating_thresholds():
+    from eqr.target import rating_for
+    assert [rating_for(x) for x in (15.0, 14.9, 0, -9.9, -10.0, -30)] == ["Buy", "Hold", "Hold", "Hold", "Sell", "Sell"]
+
+
+def test_price_target_pe_math_and_rating():
+    from datetime import date
+    from eqr.target import get_price_target
+
+    r = get_price_target("aaa", ["PEER"], "pe", SCEN, today=date(2026, 11, 19), valuation_fn=_val())
+    # 4*.95*9=34.2, 4*1.03*11=45.32, 4*1.08*13=56.16 -> .25/.5/.25 weighted = 45.25
+    assert [s["price"] for s in r["scenarios"]] == [34.2, 45.32, 56.16] and r["price_target"] == 45.25
+    assert r["dividend_yield_pct"] == 5.0 and r["expected_price_return_pct"] == 13.1
+    assert r["expected_total_return_pct"] == 18.1 and r["rating"] == "Buy" and r["conviction"] == "Normal"
+    assert r["flags"] == [] and r["source"] == "calc:target:AAA:2026-11-19"
+    assert "web:https://q.example/a" in r["sources"] and not any(x.startswith("calc:valuation") for x in r["sources"])
+    mid = r["sensitivity"]["rows"][2]["prices"][2]
+    assert len(r["sensitivity"]["rows"]) == 5 and mid == r["scenarios"][1]["price"]  # grid centre = base case
+
+
+def test_price_target_ev_ebit_path_and_dividend_effect():
+    from eqr.target import get_price_target
+
+    sc = {k: {**v, "growth_pct": 0, "multiple": m} for (k, v), m in zip(SCEN.items(), (8, 10, 12))}
+    r = get_price_target("AAA", [], "ev_ebit", sc, valuation_fn=_val(price=80.0, dps=None))
+    # (1000*10 - 2000)/100 = 80 base; bear 60; bull 100 -> target 80; no dividend known
+    assert r["price_target"] == 80.0 and r["expected_total_return_pct"] == 0.0 and r["rating"] == "Hold"
+    assert "dividend_unknown" in r["flags"] and r["conviction"] == "Low"
+
+
+def test_price_target_guardrails():
+    from eqr.target import get_price_target
+    import copy
+
+    def run(sc=None, method="pe", **kw):
+        return get_price_target("AAA", ["P"], method, sc or SCEN, valuation_fn=_val(**kw))
+    bad = copy.deepcopy(SCEN); bad["bear"]["multiple"] = 14        # bear above base
+    with pytest.raises(ValueError, match="ordered"):
+        run(bad)
+    wild = copy.deepcopy(SCEN); wild["bull"]["multiple"] = 90
+    with pytest.raises(ValueError, match="multiple must be between"):
+        run(wild)
+    wild2 = copy.deepcopy(SCEN); wild2["base"]["growth_pct"] = 400
+    with pytest.raises(ValueError, match="growth_pct"):
+        run(wild2)
+    with pytest.raises(ValueError, match="exactly"):
+        run({"base": SCEN["base"]})
+    w = copy.deepcopy(SCEN)
+    for k, x in zip(w, (0.1, 0.1, 0.1)):
+        w[k]["weight"] = x
+    with pytest.raises(ValueError, match="weights"):
+        run(w)
+    with pytest.raises(ValueError, match="not positive"):
+        run(eps=-1.0)
+    with pytest.raises(ValueError, match="price unavailable"):
+        run(withheld=True, flags=["price_conflict"])
+    with pytest.raises(ValueError, match="net debt"):
+        run(method="ev_ebit", nd=None)
+
+
+def test_unanchored_multiple_and_thin_peers_lower_conviction():
+    from eqr.target import get_price_target
+
+    sc = {"bear": {"growth_pct": -5, "multiple": 18, "rationale": "x"}, "base": {"growth_pct": 3, "multiple": 20, "rationale": "x"},
+          "bull": {"growth_pct": 8, "multiple": 22, "rationale": "x"}}
+    r = get_price_target("AAA", ["P"], "pe", sc, valuation_fn=_val(pe=10.0, med_pe=11.0, med_n=1))
+    assert {"multiple_not_anchored", "few_peers"} <= set(r["flags"]) and r["conviction"] == "Low"
+
+
+def _rec_note(rating="Buy", pt=45.25):
+    return ResearchNote(ticker="AAA", company="A", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[],
+                        recommendation={"rating": rating, "price_target": pt, "current_price": 40.0, "expected_total_return_pct": 18.1,
+                                        "method": "pe", "conviction": "Normal", "rationale": "r", "sources": ["calc:target:AAA:2026-11-19"],
+                                        "scenarios": [{"name": "base", "weight": 0.5, "growth_pct": 3, "multiple": 11, "price": 45.32, "rationale": "b"}]})
+
+
+def _target_trace(rating="Buy", pt=45.25):
+    import json as _json
+    res = {"rating": rating, "price_target": pt, "current_price": 40.0, "expected_total_return_pct": 18.1}
+    return {"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "get_price_target", "input": {}}]},
+                         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": _json.dumps(res), "is_error": False}]}]}
+
+
+def test_recommendation_must_match_computed_result():
+    from eqr.graders import recommendation_consistent
+
+    assert recommendation_consistent(_rec_note(), _target_trace()) == 1.0
+    assert recommendation_consistent(_rec_note(rating="Sell"), _target_trace()) == 0.0   # note changed the rating
+    assert recommendation_consistent(_rec_note(pt=60.0), _target_trace()) == 0.0         # note changed the target
+    assert recommendation_consistent(_rec_note(), {"messages": []}) == 0.0               # rating with no computed basis
+    plain = ResearchNote(ticker="A", company="A", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[])
+    assert recommendation_consistent(plain, {"messages": []}) is None
+    assert recommendation_consistent(plain, _target_trace()) == 0.0                      # computed a target but dropped it
+
+
+def test_pdf_shows_rating_box_and_derivation(tmp_path):
+    import json as _json
+    from datetime import date
+    from pypdf import PdfReader
+    from eqr.pdf import build_pdf
+    from eqr.target import get_price_target
+
+    res = get_price_target("AAA", ["P"], "pe", SCEN, today=date(2026, 11, 19), valuation_fn=_val())
+    trace = _fake_trace()
+    trace["messages"] += [{"role": "assistant", "content": [{"type": "tool_use", "id": "pt", "name": "get_price_target", "input": {}}]},
+                          {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "pt", "content": _json.dumps(res), "is_error": False}]}]
+    note = ResearchNote(ticker="AAA", company="Alpha Co", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[],
+                        recommendation={"rating": res["rating"], "price_target": res["price_target"], "current_price": res["current_price"],
+                                        "price_date": res["price_date"], "expected_total_return_pct": res["expected_total_return_pct"],
+                                        "method": "pe", "conviction": res["conviction"], "scenarios": res["scenarios"],
+                                        "rationale": "Dividend plus modest growth. R&amp;D steady.", "sources": res["sources"]})
+    out = build_pdf(note, trace, tmp_path / "rec.pdf", filing_info=lambda t, acc: (f"{t} 10-K {acc}", f"https://sec.example/{acc}"))
+    text = "\n".join(p.extract_text() for p in PdfReader(str(out)).pages)
+    assert "BUY" in text and "$45.25" in text and "18.1%" in text and "12-MONTH PRICE TARGET" in text
+    assert "Rating rule (fixed in code)" in text and "Probability-weighted target" in text
+    assert "Sensitivity" in text and "$45.32" in text            # base-case centre of the grid
+    assert "Not investment advice" in text or "not a recommendation to buy or sell" in text
+    assert "R&D steady" in text and "calc:target" not in text      # entity decoded; ids replaced by markers
+
+
+def test_unresolvable_derived_ids_do_not_become_references():
+    from eqr.citations import Refs
+
+    refs = Refs({"calc:valuation:X:1": {"web:https://p.example/x"}}, {}, filing_info=lambda t, a: (f"{t} {a}", None))
+    assert refs.cite(["calc:valuation:X:1"]) == [1]
+    assert refs.cite(["calc:valuation:UNKNOWN:9", "edgar:comps:UNKNOWN:9"]) == []   # silently dropped
+    assert [i["label"] for i in refs.items] == ["p.example"]

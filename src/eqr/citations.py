@@ -59,6 +59,7 @@ class Artifacts:
     valuation: list[dict] = field(default_factory=list)
     valuation_medians: dict = field(default_factory=dict)
     valuation_calls: int = 0
+    price_target: dict | None = None
     notes: list[str] = field(default_factory=list)
     inputs_of: dict[str, set[str]] = field(default_factory=dict)  # derived source id -> underlying source ids
     titles: dict[str, str] = field(default_factory=dict)  # web url -> page title
@@ -91,6 +92,10 @@ def artifacts_from_trace(trace: dict) -> Artifacts:
             a.notes += [n for n in res.get("notes", []) if n not in a.notes]
             for r in res.get("rows", []):
                 a.inputs_of[r["source"]] = set(r.get("sources", [])) - {r["source"]}
+        elif name == "get_price_target":
+            a.price_target = res
+            # derived calc:valuation ids carry no extra information (their leaf sources are listed too)
+            a.inputs_of[res["source"]] = {x for x in res.get("sources", []) if not x.startswith("calc:valuation:")} - {res["source"]}
         elif name == "web_search":
             for r in res.get("results", []):
                 if r.get("title"):
@@ -126,11 +131,11 @@ class Refs:
         self._idx: dict[str, int] = {}
 
     def _leaves(self, sid: str, depth: int = 0) -> list[str]:
-        if sid.startswith(("edgar:comps:", "calc:valuation:")) and depth < 4:
+        if sid.startswith(("edgar:comps:", "calc:valuation:", "calc:target:")) and depth < 4:
             out: list[str] = []
             for i in sorted(self.inputs_of.get(sid, [])):
                 out += self._leaves(i, depth + 1)
-            return out or [sid]
+            return out  # a derived id with no known inputs has nothing a reader can follow: no reference
         return [sid]
 
     @staticmethod

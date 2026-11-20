@@ -104,7 +104,7 @@ def make_table(header: list[str], rows: list[list[str]], widths: list[float], bo
 
 FIN_ROWS = [("revenue", "Revenue ($M)", fm), ("gross_profit", "Gross profit ($M)", fm),
             ("operating_income", "Operating income ($M)", fm), ("net_income", "Net income ($M)", fm),
-            ("eps_diluted", "Diluted EPS ($)", fe), ("operating_cash_flow", "Operating cash flow ($M)", fm),
+            ("eps_diluted", "Diluted EPS ($)", fe), ("dps", "Dividends per share ($)", fe), ("operating_cash_flow", "Operating cash flow ($M)", fm),
             ("capex", "Capex ($M)", fm), ("cash", "Cash ($M)", fm), ("long_term_debt", "Long-term debt ($M)", fm),
             ("total_assets", "Total assets ($M)", fm), ("total_liabilities", "Total liabilities ($M)", fm),
             ("shareholders_equity", "Shareholders' equity ($M)", fm)]
@@ -206,6 +206,81 @@ def valuation_table(a: Artifacts, refs: Refs, subject: str) -> list:
                       "(see references) and are verified in code, but treat flagged rows with caution.", SMALL)]
 
 
+RATING_COLORS = {"Buy": colors.HexColor("#1B7F3B"), "Hold": colors.HexColor("#B7791F"), "Sell": colors.HexColor("#B42318")}
+
+
+def _rec_data(a: Artifacts, note: ResearchNote) -> dict | None:
+    """Prefer the tool's computed result; fall back to the model's copy of it."""
+    if a.price_target:
+        return a.price_target
+    return note.recommendation.model_dump() if note.recommendation else None
+
+
+def recommendation_box(rec: dict, refs: Refs) -> Table:
+    big = ParagraphStyle("rating", parent=BASE, fontName="Helvetica-Bold", fontSize=22, leading=26,
+                         textColor=colors.white, alignment=1, spaceAfter=0)
+    lab = ParagraphStyle("lab", parent=SMALL, fontSize=7, leading=9, spaceAfter=0)
+    val = ParagraphStyle("val", parent=BASE, fontName="Helvetica-Bold", fontSize=12, leading=14, spaceAfter=0)
+    horizon = rec.get("horizon_months", 12)
+    pr, dy = rec.get("expected_price_return_pct"), rec.get("dividend_yield_pct")
+    split = f" (price {pr:+.1f}% + dividend {dy:.1f}%)" if pr is not None and dy is not None else ""
+    cells = [
+        [Paragraph(safe(rec["rating"]).upper(), big),
+         [Paragraph(f"{horizon}-MONTH PRICE TARGET", lab), Paragraph(f"${rec['price_target']:,.2f}", val)],
+         [Paragraph("CURRENT PRICE", lab), Paragraph(f"${rec['current_price']:,.2f}", val),
+          Paragraph(safe(rec.get("price_date") or ""), lab)],
+         [Paragraph("EXPECTED TOTAL RETURN", lab), Paragraph(f"{rec['expected_total_return_pct']:+.1f}%", val),
+          Paragraph(safe(split), lab)],
+         [Paragraph("METHOD / CONVICTION", lab), Paragraph(f"{safe(rec['method']).upper()} / {safe(rec.get('conviction', ''))}", val)]]]
+    t = Table(cells, colWidths=[84, 105, 100, 135, 101])
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, 0), RATING_COLORS.get(rec["rating"], NAVY)),
+                           ("BACKGROUND", (1, 0), (-1, 0), LIGHT), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                           ("BOX", (0, 0), (-1, -1), 0.6, NAVY), ("TOPPADDING", (0, 0), (-1, -1), 8),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    return t
+
+
+def target_section(a: Artifacts, note: ResearchNote, refs: Refs) -> list:
+    rec = _rec_data(a, note)
+    if not rec:
+        return []
+    out: list = [Paragraph("Price target and rating derivation", H2),
+                 Paragraph(f"<b>Rating rule (fixed in code):</b> {safe(rec.get('rating_rule', 'see methodology'))}", BASE)]
+    unit = "EPS growth" if rec["method"] == "pe" else "EBIT growth"
+    mult = "Target P/E" if rec["method"] == "pe" else "Target EV/EBIT"
+    rows = [[safe(s["name"]).title(), f"{s['weight'] * 100:.0f}%", f"{s['growth_pct']:+.1f}%", f"{s['multiple']:.1f}x",
+             f"${s['price']:,.2f}", f"{(s['price'] / rec['current_price'] - 1) * 100:+.1f}%"] for s in rec["scenarios"]]
+    rows.append(["Probability-weighted target", "100%", "", "", f"${rec['price_target']:,.2f}",
+                 f"{rec.get('expected_price_return_pct', 0):+.1f}%"])
+    out.append(make_table(["Scenario", "Probability", f"{unit} (12m)", mult, "Implied price", "vs current"], rows,
+                          [150, 60, 85, 80, 80, 70], bold_rows={len(rows) - 1}))
+    anchors = rec.get("anchors") or {}
+    if anchors:
+        cur, med = anchors.get("current_multiple"), anchors.get("peer_median_multiple")
+        out.append(Paragraph(f"Anchors: current {safe(rec['method'])} multiple {fx(cur)}; peer median {fx(med)} "
+                             f"(n={anchors.get('peers_in_median', 0)}). Dividend yield uses the last declared dividend "
+                             f"per share.", SMALL))
+    out.append(Paragraph("Scenario assumptions (the model's judgement, with its evidence)", H2))
+    for s in rec["scenarios"]:
+        out.append(Paragraph(f"<b>{safe(s['name']).title()}:</b> {rich(s.get('rationale', ''), refs)}", BULLET, bulletText="-"))
+    sens = rec.get("sensitivity")
+    if sens:
+        hdr = [f"{unit} \\ {mult}"] + [f"{m:.1f}x" for m in sens["multiples"]]
+        grid = [[f"{r['growth_pct']:+.1f}%"] + [("n/a" if p is None else f"${p:,.2f}") for p in r["prices"]]
+                for r in sens["rows"]]
+        out += [Paragraph("Sensitivity: implied price, base-case assumptions varied", H2),
+                make_table(hdr, grid, [105] + [84] * 5, bold_rows={2})]
+    if note.recommendation and note.recommendation.rationale:
+        out += [Paragraph("Why this rating", H2), Paragraph(rich(note.recommendation.rationale, refs) + " "
+                + marker(refs.cite(note.recommendation.sources)), BASE)]
+    flags = (rec.get("flags") or []) + (rec.get("data_flags") or [])
+    if flags:
+        out.append(Paragraph("Flags: " + safe(", ".join(flags)), SMALL))
+    for n in rec.get("notes", []):
+        out.append(Paragraph(safe(n), BULLET, bulletText="-"))
+    return out
+
+
 # ----------------------------------------------------------------------------- document
 def build_pdf(note: ResearchNote, trace: dict, path: str | Path, today: date | None = None,
               filing_info=None) -> Path:
@@ -225,7 +300,15 @@ def build_pdf(note: ResearchNote, trace: dict, path: str | Path, today: date | N
     box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF6E0")),
                              ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E0B84C")),
                              ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
-    story += [box, Paragraph("Summary", H2), Paragraph(rich(note.summary, refs), BASE),
+    rec = _rec_data(a, note)
+    if rec:
+        story += [box, Spacer(1, 8), recommendation_box(rec, refs),
+                  Paragraph("Rating and target are the output of a fixed rule applied to model-proposed scenarios "
+                            "(see derivation). Illustration only, not a recommendation to buy or sell any security. "
+                            + marker(refs.cite(rec.get("sources", []))), SMALL)]
+    else:
+        story += [box]
+    story += [Paragraph("Summary", H2), Paragraph(rich(note.summary, refs), BASE),
               Paragraph("Thesis", H2), Paragraph(rich(note.thesis, refs), BASE)]
 
     story += [Paragraph("Financial summary", H2)] + financial_table(a, refs)
@@ -233,6 +316,7 @@ def build_pdf(note: ResearchNote, trace: dict, path: str | Path, today: date | N
     if note.peer_commentary:
         story += [Spacer(1, 4), Paragraph(rich(note.peer_commentary, refs), BASE)]
     story += [Paragraph("Peer comparison: valuation", H2)] + valuation_table(a, refs, note.ticker)
+    story += target_section(a, note, refs)
 
     for title, claims in (("Bull case", note.bull_case), ("Bear case", note.bear_case), ("Key risks", note.key_risks)):
         block = [Paragraph(title, H2)]

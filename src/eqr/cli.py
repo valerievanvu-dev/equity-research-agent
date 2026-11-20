@@ -24,6 +24,15 @@ def render(n: ResearchNote) -> str:
         return f"{v:,.2f} {unit}"
 
     lines = [f"# {n.company} ({n.ticker})", "", n.summary, "", "## Thesis", n.thesis, "", "## Metrics"]
+    if n.recommendation:
+        r = n.recommendation
+        lines[1:1] = ["", f"**Rating: {r.rating} | {r.horizon_months}-month price target ${r.price_target:,.2f} | "
+                      f"current ${r.current_price:,.2f} | expected total return {r.expected_total_return_pct:+.1f}% | "
+                      f"conviction {r.conviction}**",
+                      f"_Method: {r.method}. Fixed-rule rating on model-proposed scenarios; illustration, not investment advice._"]
+        lines += ["", "## Recommendation", r.rationale] + [
+            f"- {s_.name}: {s_.weight * 100:.0f}% weight, growth {s_.growth_pct:+.1f}%, {s_.multiple:.1f}x -> ${s_.price:,.2f}. {s_.rationale}"
+            for s_ in r.scenarios]
     lines += [f"- {m.name} {m.period}: {fmt(m.value, m.unit)}  `{m.sources[0]}`" for m in n.metrics]
     if n.comps:
         cols = sorted({k for c in n.comps for k in c.metrics})
