@@ -5,7 +5,7 @@ import ast
 import operator
 from typing import Any
 
-from . import comps, edgar, valuation, web
+from . import comps, edgar, target, valuation, web
 from .schemas import ResearchNote
 
 TOOLS: list[dict] = [
@@ -100,6 +100,26 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "get_price_target",
+        "description": (
+            "Computes a 12-month price target, expected total return (price + dividend) and a Buy/Hold/Sell from YOUR "
+            "bear/base/bull assumptions. Code does the math and applies a FIXED rating rule: you cannot choose the rating. "
+            "Anchor each multiple to evidence (guidance, MD&A trends, the subject's current multiple, the peer median from "
+            "get_valuation). Bounds are enforced and violations return an error to fix. Call once, after get_valuation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "peer_tickers": {"type": "array", "items": {"type": "string"}, "description": "same peers you used in get_valuation"},
+                "method": {"type": "string", "enum": ["pe", "ev_ebit"], "description": "pe needs positive EPS; ev_ebit needs positive EBIT and known net debt"},
+                "scenarios": {"type": "object", "properties": {"bear": {"type": "object", "properties": {"growth_pct": {"type": "number", "description": "% change in EPS (pe) or EBIT (ev_ebit) from the latest fiscal year to 12 months out"}, "multiple": {"type": "number", "description": "target P/E or EV/EBIT at the horizon"}, "weight": {"type": "number", "description": "optional probability; omit on all three for 25/50/25"}, "rationale": {"type": "string", "description": "evidence-based reason for these two numbers (guidance, trends, peer multiples), citing source ids inline"}}, "required": ["growth_pct", "multiple", "rationale"]}, "base": {"type": "object", "properties": {"growth_pct": {"type": "number", "description": "% change in EPS (pe) or EBIT (ev_ebit) from the latest fiscal year to 12 months out"}, "multiple": {"type": "number", "description": "target P/E or EV/EBIT at the horizon"}, "weight": {"type": "number", "description": "optional probability; omit on all three for 25/50/25"}, "rationale": {"type": "string", "description": "evidence-based reason for these two numbers (guidance, trends, peer multiples), citing source ids inline"}}, "required": ["growth_pct", "multiple", "rationale"]}, "bull": {"type": "object", "properties": {"growth_pct": {"type": "number", "description": "% change in EPS (pe) or EBIT (ev_ebit) from the latest fiscal year to 12 months out"}, "multiple": {"type": "number", "description": "target P/E or EV/EBIT at the horizon"}, "weight": {"type": "number", "description": "optional probability; omit on all three for 25/50/25"}, "rationale": {"type": "string", "description": "evidence-based reason for these two numbers (guidance, trends, peer multiples), citing source ids inline"}}, "required": ["growth_pct", "multiple", "rationale"]}}, "required": ["bear", "base", "bull"]},
+                "horizon_months": {"type": "integer", "default": 12},
+            },
+            "required": ["ticker", "peer_tickers", "method", "scenarios"],
+        },
+    },
+    {
         "name": "web_search",
         "description": (
             "Search the web (Parallel) for news, catalysts, competitor moves, management commentary and other "
@@ -178,6 +198,8 @@ def run_tool(name: str, args: dict[str, Any]) -> dict:
         return comps.get_comps(**args)
     if name == "get_valuation":
         return valuation.get_valuation(**args)
+    if name == "get_price_target":
+        return target.get_price_target(**args)
     if name == "web_search":
         return web.web_search(**args)
     if name == "calculator":

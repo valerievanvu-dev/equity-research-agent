@@ -27,6 +27,7 @@ METRICS: dict[str, tuple[str, list[str]]] = {
     "operating_income": ("duration", ["OperatingIncomeLoss"]),
     "net_income": ("duration", ["NetIncomeLoss"]),
     "eps_diluted": ("duration", ["EarningsPerShareDiluted"]),
+    "dps": ("duration", ["CommonStockDividendsPerShareDeclared", "CommonStockDividendsPerShareCashPaid"]),
     "operating_cash_flow": ("duration", ["NetCashProvidedByUsedInOperatingActivities"]),
     "capex": ("duration", ["PaymentsToAcquirePropertyPlantAndEquipment"]),
     "total_assets": ("instant", ["Assets"]),

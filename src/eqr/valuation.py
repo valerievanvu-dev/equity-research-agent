@@ -81,6 +81,14 @@ def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn) -> dict:
         put("pe", price["price"] / eps["value"], "x", ["eps_diluted"])
     if "fcf" in m:
         put("fcf_yield_pct", m["fcf"]["value"] / mcap * 100, "percent", ["fcf"])
+    for k in ("eps_diluted", "operating_income", "net_debt_proxy", "revenue", "dps"):
+        if k in m:
+            srcs.update(m[k]["sources"])
+    row["fundamentals"] = {"eps_diluted": m.get("eps_diluted", {}).get("value"),
+                           "operating_income": m.get("operating_income", {}).get("value"),
+                           "net_debt_proxy": m.get("net_debt_proxy", {}).get("value"),
+                           "revenue": m.get("revenue", {}).get("value"),
+                           "dps": m.get("dps", {}).get("value"), "shares": sh["shares"]}
     for k, lo, hi in (("pe", 4, 150), ("ev_ebit", 3, 100), ("fcf_yield_pct", -50, 20)):
         v = row["metrics"].get(k, {}).get("value")
         if v is not None and not lo <= v <= hi:

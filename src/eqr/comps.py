@@ -28,16 +28,22 @@ UNIVERSES: dict[str, list[dict]] = {
         {"ticker": "SBH", "name": "Sally Beauty", "segment": "professional/DIY beauty retail"},
         {"ticker": "PG", "name": "Procter & Gamble", "segment": "diversified: beauty is one segment, use with caution"},
     ],
+    "tobacco": [
+        {"ticker": "MO", "name": "Altria", "segment": "US cigarettes, smokeless, oral nicotine"},
+        {"ticker": "PM", "name": "Philip Morris International", "segment": "international cigarettes and smoke-free (IQOS)"},
+        {"ticker": "TPB", "name": "Turning Point Brands", "segment": "US smokeless/papers (small cap)"},
+        {"ticker": "UVV", "name": "Universal Corp", "segment": "leaf tobacco supplier (B2B, not a brand owner)"},
+    ],
 }
 
 NOTES = [
     "Operating comps only: no valuation multiples because EDGAR has no market prices.",
     "Fiscal years are not calendar aligned. Compare using period_end, not fiscal-year labels.",
     "net_debt_proxy = long_term_debt - cash. It excludes current debt and lease liabilities.",
-    "SEC filers only: L'Oreal, Shiseido, Beiersdorf, Kao, Amorepacific are not covered.",
+    "SEC 10-K filers only: leaders that file 20-F/40-F (e.g. L'Oreal, Shiseido, Beiersdorf, BAT, Imperial) are not covered.",
     "Medians exclude stale rows (latest annual period older than 15 months).",
 ]
-NEEDED = ["revenue", "gross_profit", "operating_income", "net_income", "eps_diluted", "operating_cash_flow", "capex",
+NEEDED = ["revenue", "gross_profit", "operating_income", "net_income", "eps_diluted", "dps", "operating_cash_flow", "capex",
           "cash", "long_term_debt"]
 STALE_DAYS = 456  # ~15 months
 
@@ -71,7 +77,8 @@ def _company(ticker: str, today: date) -> dict:
             metrics[name] = {"value": value, "unit": unit, "sources": [r["source"] for r in rows]}
 
     put("revenue", cur["value"], "USD", [cur])
-    for name, unit in (("operating_income", "USD"), ("net_income", "USD"), ("eps_diluted", "USD/shares")):
+    for name, unit in (("operating_income", "USD"), ("net_income", "USD"), ("eps_diluted", "USD/shares"),
+                       ("dps", "USD/shares")):
         if pick[name]:
             put(name, pick[name]["value"], unit, [pick[name]])
     if len(revs) > 1:

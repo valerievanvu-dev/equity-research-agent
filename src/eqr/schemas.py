@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -42,6 +43,34 @@ class ValuationRow(BaseModel):
     sources: list[str] = Field(min_length=1, description="The row's `source` id and/or `sources` from get_valuation")
 
 
+class ScenarioOut(BaseModel):
+    name: Literal["bear", "base", "bull"]
+    weight: float
+    growth_pct: float
+    multiple: float
+    price: float
+    rationale: str
+
+    _clean = field_validator("rationale")(_unescape)
+
+
+class Recommendation(BaseModel):
+    rating: Literal["Buy", "Hold", "Sell"] = Field(description="Copy exactly from get_price_target; never change it")
+    price_target: float = Field(description="12-month price target in USD, exactly as computed")
+    horizon_months: int = 12
+    current_price: float
+    price_date: str | None = None
+    expected_total_return_pct: float
+    method: str
+    conviction: str = Field(description="Copy from get_price_target: Normal or Low")
+    scenarios: list[ScenarioOut]
+    rationale: str = Field(description="Why this rating, consistent with the computed result, citing sources inline")
+    flags: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(min_length=1, description="The `source` / `sources` ids from get_price_target")
+
+    _clean = field_validator("rationale")(_unescape)
+
+
 class ResearchNote(BaseModel):
     ticker: str
     company: str
@@ -51,6 +80,7 @@ class ResearchNote(BaseModel):
     bull_case: list[Claim]
     bear_case: list[Claim]
     key_risks: list[Claim]
+    recommendation: Recommendation | None = Field(default=None, description="Rating and price target, copied exactly from get_price_target")
     comps: list[CompsRow] = Field(default_factory=list, description="Peer table: the subject company plus its peers, from get_comps")
     valuation: list[ValuationRow] = Field(default_factory=list, description="Valuation multiples for subject and peers, from get_valuation")
     peer_commentary: str = Field(default="", description="How the company ranks vs peers and why, citing the comps rows")

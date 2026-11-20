@@ -5,6 +5,7 @@ Add an LLM-judge for thesis quality as a separate, clearly-labelled score (see R
 """
 from __future__ import annotations
 
+from .citations import tool_calls
 from .schemas import ResearchNote
 
 DEFAULT_TOL = 0.005  # 0.5% relative
@@ -27,7 +28,7 @@ def metric_accuracy(note: ResearchNote, expected: list[dict]) -> tuple[float, li
 
 
 def _cited(note: ResearchNote) -> list[str]:
-    ids = [s for m in note.metrics for s in m.sources] + [s for c in note.comps for s in c.sources] + [s for v in note.valuation for s in v.sources]
+    ids = [s for m in note.metrics for s in m.sources] + [s for c in note.comps for s in c.sources] + [s for v in note.valuation for s in v.sources] + (note.recommendation.sources if note.recommendation else [])
     for group in (note.bull_case, note.bear_case, note.key_risks):
         ids += [s for c in group for s in c.sources]
     return ids
@@ -39,18 +40,36 @@ def citation_grounded(note: ResearchNote, sources_seen: set[str]) -> float:
     return sum(i in sources_seen for i in ids) / len(ids) if ids else 0.0
 
 
+def recommendation_consistent(note: ResearchNote, trace: dict) -> float | None:
+    """1.0 if the note's rating/target match the tool's computed result exactly, 0.0 if not, None if not applicable.
+    A note that hands back a different rating or target than the code computed is a transcription or integrity failure."""
+    results = [r for name, _inp, r in tool_calls(trace) if name == "get_price_target"]
+    rec = note.recommendation
+    if rec is None:
+        return 0.0 if results else None  # computed a target but dropped it from the note
+    if not results:
+        return 0.0  # a rating with no computed basis is invented
+    r = results[-1]
+    ok = (rec.rating == r["rating"] and abs(rec.price_target - r["price_target"]) < 0.01
+          and abs(rec.current_price - r["current_price"]) < 0.01
+          and abs(rec.expected_total_return_pct - r["expected_total_return_pct"]) < 0.05)
+    return 1.0 if ok else 0.0
+
+
 def grade(case: dict, note: ResearchNote | None, trace: dict) -> dict:
     if note is None:
         return {"schema_ok": 0.0, "metric_accuracy": 0.0, "citation_grounded": 0.0, "reward": 0.0, "passed": False,
                 "details": []}
     acc, details = metric_accuracy(note, case.get("expected", []))
     cit = citation_grounded(note, set(trace.get("sources_seen", [])))
+    rec = recommendation_consistent(note, trace)
     reward = 0.6 * acc + 0.4 * cit
     return {
         "schema_ok": 1.0,
         "metric_accuracy": acc,
         "citation_grounded": cit,
+        "recommendation_consistent": rec,
         "reward": round(reward, 4),
-        "passed": acc >= 0.999 and cit >= 0.999,
+        "passed": acc >= 0.999 and cit >= 0.999 and rec in (None, 1.0),
         "details": details,
     }
