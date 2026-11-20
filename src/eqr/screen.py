@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
-from . import comps, history, valuation
+from . import comps, history, thesis, valuation
 from .comps import UNIVERSES
 from .schemas import ResearchNote
 
@@ -181,6 +181,10 @@ def run_one(ticker: str, *, model: str | None = None, engine: str | None = None,
             error = (error or "") + f" PDF failed: {type(e).__name__}: {e}"
         try:
             history.log_rating(note, trace)
+        except Exception:
+            pass
+        try:
+            thesis.create(note, trace)
         except Exception:
             pass
     return summarize(note, trace, md_path, pdf_path, error)

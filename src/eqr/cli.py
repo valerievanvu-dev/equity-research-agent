@@ -4,7 +4,7 @@ import argparse
 from datetime import date
 from pathlib import Path
 
-from . import history
+from . import history, thesis
 from .agent import run
 from .schemas import ResearchNote
 
@@ -103,6 +103,10 @@ def main() -> None:
         print(f"\nreport saved: {report}")
         try:
             history.log_rating(res.note, res.trace)  # one line per rating, for a later backtest
+        except Exception:
+            pass
+        try:
+            thesis.create(res.note, res.trace)  # keeps your own pillars; `eqr-track thesis check` re-tests it later
         except Exception:
             pass
         deliver(res.note, res.trace, args.ticker.upper(), args.no_email)
