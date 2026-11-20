@@ -1169,3 +1169,53 @@ def test_run_one_writes_outputs_summarizes_and_logs(tmp_path, monkeypatch):
     assert out["rating"] == "Buy" and out["consistent"] == 1.0 and out["conviction"] == "Normal" and out["trace_url"] == "https://t/9"
     assert Path(out["pdf"]).exists() and Path(out["md"]).exists()
     assert (tmp_path / "data" / "ratings_history.jsonl").read_text().count("\n") == 1
+
+
+def test_search_cache_expires_by_default_and_is_overridable(tmp_path, monkeypatch):
+    import os
+    import time
+    from types import SimpleNamespace as NS
+    from eqr import web
+
+    monkeypatch.setattr(web, "CACHE_DIR", tmp_path)
+    monkeypatch.setenv("PARALLEL_API_KEY", "k")
+    monkeypatch.delenv("EQR_SEARCH_TTL_HOURS", raising=False)
+    calls = []
+
+    def post(url, headers, json, timeout):
+        calls.append(1)
+        return NS(status_code=200, json=lambda: {"results": [{"url": "https://x.com/a", "excerpts": ["e"]}]})
+    monkeypatch.setattr(web.httpx, "post", post)
+
+    def age(hours):
+        for f in tmp_path.glob("*.json"):
+            t = time.time() - hours * 3600
+            os.utime(f, (t, t))
+    web.web_search("o", ["q"]); web.web_search("o", ["q"])
+    assert len(calls) == 1                                       # fresh: served from cache
+    age(5); web.web_search("o", ["q"])
+    assert len(calls) == 1                                       # 5 hours old: still inside the 6-hour default
+    age(7); web.web_search("o", ["q"])
+    assert len(calls) == 2                                       # 7 hours old: searched again, not stale news
+    age(100); monkeypatch.setenv("EQR_SEARCH_TTL_HOURS", "0"); web.web_search("o", ["q"])
+    assert len(calls) == 2                                       # 0 = never expire (reproducible evals)
+    monkeypatch.setenv("EQR_SEARCH_TTL_HOURS", "1"); web.web_search("o", ["q"])
+    assert len(calls) == 3                                       # custom 1-hour expiry applies
+    age(2); web.web_search("o", ["q"], cache_ttl_s=900)
+    assert len(calls) == 4                                       # an explicit TTL (price lookups) beats the default
+    age(100); web.web_search("o", ["q"], cache_ttl_s=None)
+    assert len(calls) == 4                                       # explicit None never expires
+
+
+def test_price_and_market_cap_lookups_keep_their_own_15_minute_expiry():
+    from datetime import date
+    from eqr import prices
+
+    seen = []
+
+    def spy(**kw):
+        seen.append(kw.get("cache_ttl_s"))
+        return {"results": []}
+    prices.get_price("X", "X Co", date(2026, 11, 19), search=spy)
+    prices.get_market_cap("X", "X Co", date(2026, 11, 19), search=spy)
+    assert seen == [900, 900]
