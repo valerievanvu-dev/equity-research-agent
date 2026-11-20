@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 eqr = "eqr.cli:main"
+eqr-screen = "eqr.screen:main"
 
 [build-system]
 requires = ["hatchling"]

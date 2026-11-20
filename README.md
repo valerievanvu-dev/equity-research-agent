@@ -41,6 +41,29 @@ on unanchored multiples, few peers, wide scenario dispersion, an uncertain price
 web quotes: within 2% agree, 2-5% apart (delayed vs live) are used at the midpoint and flagged, wider is withheld.
 Output is a model-assisted illustration, not investment advice.
 
+## Buy screener
+
+```bash
+uv run eqr-screen beauty --top 5            # a built-in universe (beauty, tobacco), or:
+uv run eqr-screen MO PM TPB UVV --top 3     # your own tickers
+uv run eqr-screen beauty --no-agent         # stage 1 only: no agent runs, no big token cost
+```
+
+**Stage 1 (code only, seconds per ticker)** ranks the universe on five signals, each a percentile *within the universe*:
+value (low P/E and EV/EBIT), FCF yield, growth, operating margin, and leverage. The weights are one dict at the top of
+`src/eqr/screen.py`. Rows with an extreme multiple (`check_outlier`) are set aside with the reason instead of being
+ranked: a P/E of 1.2 from a one-off gain would otherwise top the list and distort everyone else's percentiles
+(`--include-suspect` overrides). Companies with no verified price or fewer than 3 measurable signals are excluded, not guessed.
+
+**Stage 2** runs the full agent on the top N in parallel (`--workers`, `--reuse-hours` to reuse recent runs). The report
+(`reports/screen-<universe>-<date>.md` and a CSV) lists Buys with normal conviction, then Buys with **low** conviction
+separately. A Buy whose note differs from the computed rating is an integrity failure, and a Buy promising more than
++/-100% is listed as *implausible, review by hand* instead of as a Buy.
+
+Caveats: screening many names and keeping the Buys partly selects for the model's optimism and for noise, and nothing
+has tested whether these ratings predict returns. Every rating is appended to `data/ratings_history.jsonl` (git-ignored)
+so a later backtest can check what past Buys did. Research leads, not advice.
+
 ## Foreign filers (IFRS, Form 20-F) and currency
 
 Companies like Unilever (UL) file a 20-F with IFRS figures in their own currency instead of a US-GAAP 10-K.

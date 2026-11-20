@@ -4,6 +4,7 @@ import argparse
 from datetime import date
 from pathlib import Path
 
+from . import history
 from .agent import run
 from .schemas import ResearchNote
 
@@ -100,6 +101,10 @@ def main() -> None:
         report.parent.mkdir(exist_ok=True)
         report.write_text(md + "\n")
         print(f"\nreport saved: {report}")
+        try:
+            history.log_rating(res.note, res.trace)  # one line per rating, for a later backtest
+        except Exception:
+            pass
         deliver(res.note, res.trace, args.ticker.upper(), args.no_email)
     else:
         print(f"FAILED: {res.error}")
