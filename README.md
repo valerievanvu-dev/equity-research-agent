@@ -23,6 +23,26 @@ tests/         offline unit tests (no key, no network)
 flags, bull/bear cases, and open questions. It is a demo of the format, **not investment advice**, and it was not audited.
 Every run saves its note to `reports/` (git-ignored) and its full trace to `runs/`.
 
+## PDF report and email
+
+Every run also writes `reports/<TICKER>-<date>.pdf` and, if email is configured, sends it to you. The PDF has the
+thesis, a 5-year financial table (all metrics, with margins and growth derived in code), every peer in the comps
+and valuation tables, bull/bear/risks, and **numbered references that link to the SEC filing or web page**.
+
+- The tables are rendered from the saved tool outputs, not from numbers the model re-typed, so a transcription
+  slip by the model cannot reach the PDF.
+- Re-render a PDF from any saved trace for free: `uv run python scripts/pdf_from_trace.py runs/<run>.json`.
+- Email uses SMTP, configured only through environment variables (nothing personal lives in the repo):
+
+```bash
+export EQR_EMAIL_TO="you@example.com"
+export EQR_SMTP_USER="you@example.com"        # SMTP login
+export EQR_SMTP_PASSWORD="app-password"       # for Gmail: an App Password, not your account password
+# optional: EQR_SMTP_HOST (default smtp.gmail.com), EQR_SMTP_PORT (default 587), EQR_EMAIL_FROM
+```
+
+If these are unset the run still succeeds and prints `email skipped`. Use `--no-email` to build the PDF without sending.
+
 ## Setup
 
 ```bash

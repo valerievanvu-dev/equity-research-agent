@@ -333,3 +333,88 @@ def test_note_prose_is_html_unescaped_but_source_ids_are_not():
     assert n.bull_case[0].text == "R&D up" and n.peer_commentary == "P&G is bigger"
     assert n.open_questions == ["A&B unknown"]
     assert n.bull_case[0].sources == [url_source]  # untouched, so it still matches the tool result
+
+
+# ------------------------------------------------------------------ PDF, citations, email
+def _fake_trace():
+    import json as _json
+
+    def use(i, name, inp=None):
+        return {"role": "assistant", "content": [{"type": "tool_use", "id": i, "name": name, "input": inp or {}}]}
+
+    def res(i, obj, err=False):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content": _json.dumps(obj), "is_error": err}]}
+
+    fin_row = lambda fy, val, m: {"fiscal_year": fy, "period_end": f"{fy}-12-31", "value": val, "unit": "USD",
+                                  "source": f"edgar:facts:AAA:{m}:FY{fy}:0000000001-{fy % 100}-000001"}
+    fin = {"company": "Alpha Co", "not_found": [], "metrics": {
+        "revenue": [fin_row(2024, 1_000_000_000, "Revenues"), fin_row(2023, 800_000_000, "Revenues")],
+        "net_income": [fin_row(2024, 100_000_000, "NetIncomeLoss"), fin_row(2023, 80_000_000, "NetIncomeLoss")]}}
+    comps_row = {"ticker": "AAA", "period_end": "2024-12-31", "stale": False, "source": "edgar:comps:AAA:2024-12-31",
+                 "metrics": {"revenue": {"value": 1e9, "unit": "USD", "sources": [fin["metrics"]["revenue"][0]["source"]]},
+                             "revenue_growth_pct": {"value": 25.0, "unit": "percent", "sources": [fin["metrics"]["revenue"][0]["source"], fin["metrics"]["revenue"][1]["source"]]}}}
+    val_row = {"ticker": "AAA", "price": 50.0, "price_date": "2026-11-19", "flags": ["single_source"], "withheld": False,
+               "source": "calc:valuation:AAA:2026-11-19", "sources": ["web:https://quotes.example/aaa", "edgar:facts:AAA:dei:EntityCommonStockSharesOutstanding:0000000001-24-000001"],
+               "metrics": {"market_cap": {"value": 5e9, "unit": "USD"}, "pe": {"value": 20.0, "unit": "x"}}}
+    return {"model": "test-model", "messages": [
+        use("1", "get_financials"), res("1", fin), use("2", "get_comps"),
+        res("2", {"rows": [comps_row], "medians": {}, "errors": {}, "notes": ["Fiscal years are not calendar aligned."]}),
+        use("3", "get_valuation"), res("3", {"rows": [val_row], "medians": {}, "errors": {}, "notes": []}),
+        use("4", "web_search"), res("4", {"results": [{"url": "https://quotes.example/aaa", "title": "AAA quote page", "excerpts": []}]}),
+        use("5", "get_comps"), res("5", {"x": 1}, err=True)]}
+
+
+def test_refs_expand_derived_ids_and_dedupe():
+    from eqr.citations import Refs, artifacts_from_trace
+
+    a = artifacts_from_trace(_fake_trace())
+    assert a.company == "Alpha Co" and set(a.financials["revenue"]) == {2023, 2024}
+    refs = Refs(a.inputs_of, a.titles, filing_info=lambda t, acc: (f"{t} filing {acc}", f"https://sec.example/{acc}"))
+    nums = refs.cite(["edgar:comps:AAA:2024-12-31"])
+    assert len(nums) == 2  # two filings behind the comps row (FY2024 + FY2023 for growth)
+    assert refs.cite(["edgar:comps:AAA:2024-12-31"]) == nums  # stable numbering
+    v = refs.cite(["calc:valuation:AAA:2026-11-19"])
+    assert any(i["url"] == "https://quotes.example/aaa" and i["label"] == "AAA quote page" for i in refs.items)
+    assert len(v) == 2
+
+
+def test_pdf_tables_come_from_tool_data_and_citations_resolve(tmp_path):
+    from pypdf import PdfReader
+    from eqr.pdf import build_pdf
+
+    note = ResearchNote(ticker="AAA", company="Alpha Co", summary="Alpha grew.", thesis="Neutral. R&D rises.",
+                        metrics=[], bull_case=[{"text": "Growth 25% (edgar:comps:AAA:2024-12-31).", "sources": ["edgar:comps:AAA:2024-12-31"]}],
+                        bear_case=[], key_risks=[], open_questions=["No EPS."])
+    out = build_pdf(note, _fake_trace(), tmp_path / "x.pdf", filing_info=lambda t, acc: (f"{t} 10-K {acc}", f"https://sec.example/{acc}"))
+    text = "\n".join(p.extract_text() for p in PdfReader(str(out)).pages)
+    assert out.read_bytes()[:4] == b"%PDF"
+    assert "1,000.0" in text and "800.0" in text      # revenue from tool data, in $M
+    assert "25.0%" in text and "10.0%" in text         # derived growth / net margin computed in code
+    assert "5,000.0" in text and "20.0x" in text       # valuation row
+    assert "single_source" in text and "Fiscal years are not calendar aligned" in text
+    assert "R&D rises" in text                          # prose escaped correctly
+    assert "edgar:comps" not in text                    # raw ids replaced by [n] markers
+    assert "References" in text and "https://sec.example/" in text and "quotes.example" in text
+
+
+def test_mailer_sends_pdf_and_requires_config(tmp_path):
+    from eqr import mailer
+
+    pdf = tmp_path / "r.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+    sent = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port): sent["host"], sent["port"] = host, port
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def login(self, u, p): sent["login"] = (u, p)
+        def send_message(self, m): sent["msg"] = m
+
+    env = {"EQR_EMAIL_TO": "me@example.com", "EQR_SMTP_USER": "u", "EQR_SMTP_PASSWORD": "p"}
+    assert mailer.send_report(pdf, "subj", "body", env=env, smtp_factory=FakeSMTP) == "me@example.com"
+    msg = sent["msg"]
+    assert msg["To"] == "me@example.com" and msg["Subject"] == "subj" and sent["port"] == 587
+    assert [a.get_filename() for a in msg.iter_attachments()] == ["r.pdf"]
+    with pytest.raises(mailer.NotConfigured, match="EQR_EMAIL_TO"):
+        mailer.send_report(pdf, "s", "b", env={}, smtp_factory=FakeSMTP)

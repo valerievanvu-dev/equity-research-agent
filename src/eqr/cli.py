@@ -8,8 +8,8 @@ from .agent import run
 from .schemas import ResearchNote
 
 DEFAULT_TASK = (
-    "Write a research note on {ticker}. Pull the last 5 fiscal years of financials (at minimum revenue, "
-    "gross_profit, operating_income, net_income, operating_cash_flow, capex), read the latest 10-K's "
+    "Write a research note on {ticker}. Pull the last 5 fiscal years of ALL financial metrics (call get_financials once with no "
+    "metrics argument), read the latest 10-K's "
     "risk_factors and mdna, search the web for recent news and catalysts, build a peer comps table (peer_universe, get_comps) and valuation multiples (get_valuation), compute margins and revenue growth with the "
     "calculator, then submit the note."
 )
@@ -47,12 +47,38 @@ def render(n: ResearchNote) -> str:
     return "\n".join(lines)
 
 
+def deliver(note: ResearchNote, trace: dict, ticker: str, no_email: bool) -> None:
+    """Build the PDF, then email it if email is configured. Failures never lose the saved report."""
+    from . import mailer
+    from .pdf import build_pdf
+
+    pdf = Path("reports") / f"{ticker}-{date.today().isoformat()}.pdf"
+    try:
+        build_pdf(note, trace, pdf)
+        print(f"pdf saved: {pdf}")
+    except Exception as e:
+        print(f"PDF failed: {type(e).__name__}: {e}")
+        return
+    if no_email:
+        return
+    body = (f"Attached: research note PDF for {note.company} ({note.ticker}).\n\n{note.summary}\n\n"
+            "Automated output from an AI agent. Not investment advice; verify against the cited filings.")
+    try:
+        to = mailer.send_report(pdf, f"Equity research: {note.company} ({note.ticker}), {date.today().isoformat()}", body)
+        print(f"emailed to {to}")
+    except mailer.NotConfigured as e:
+        print(f"email skipped: {e}")
+    except Exception as e:  # SMTP/auth errors: report, keep the PDF
+        print(f"email failed: {type(e).__name__}: {e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run the equity research agent on a ticker")
     ap.add_argument("ticker")
     ap.add_argument("--task", help="Override the default task prompt ({ticker} is substituted)")
     ap.add_argument("--model")
     ap.add_argument("--max-turns", type=int, default=15)
+    ap.add_argument("--no-email", action="store_true", help="build the PDF but do not email it")
     args = ap.parse_args()
 
     res = run((args.task or DEFAULT_TASK).format(ticker=args.ticker.upper()), ticker=args.ticker.upper(),
@@ -64,6 +90,7 @@ def main() -> None:
         report.parent.mkdir(exist_ok=True)
         report.write_text(md + "\n")
         print(f"\nreport saved: {report}")
+        deliver(res.note, res.trace, args.ticker.upper(), args.no_email)
     else:
         print(f"FAILED: {res.error}")
     t = res.trace
