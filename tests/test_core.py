@@ -418,3 +418,32 @@ def test_mailer_sends_pdf_and_requires_config(tmp_path):
     assert [a.get_filename() for a in msg.iter_attachments()] == ["r.pdf"]
     with pytest.raises(mailer.NotConfigured, match="EQR_EMAIL_TO"):
         mailer.send_report(pdf, "s", "b", env={}, smtp_factory=FakeSMTP)
+
+
+def test_macos_mail_method_passes_args_safely_and_reports_failures(tmp_path):
+    from types import SimpleNamespace as NS
+    from eqr import mailer
+
+    pdf = tmp_path / "r.pdf"
+    pdf.write_bytes(b"%PDF-1.4 test")
+    calls = {}
+
+    def fake_run(cmd, **kw):
+        calls["cmd"], calls["kw"] = cmd, kw
+        return NS(returncode=0, stderr="")
+
+    env = {"EQR_EMAIL_METHOD": "macos-mail", "EQR_EMAIL_TO": "me@example.com"}
+    tricky = 'Subject with "quotes" & a \\ backslash'
+    assert mailer.send_report(pdf, tricky, "body", env=env, run=fake_run, platform="darwin") == "me@example.com"
+    cmd = calls["cmd"]
+    assert cmd[:2] == ["osascript", "-"] and cmd[2] == tricky and cmd[4] == "me@example.com"  # args via argv, not interpolated
+    assert cmd[5] == str(pdf.resolve()) and cmd[6] == ""
+    assert 'tell application "Mail"' in calls["kw"]["input"] and tricky not in calls["kw"]["input"]
+
+    bad = lambda cmd, **kw: NS(returncode=1, stderr="Not authorized to send Apple events to Mail.")
+    with pytest.raises(RuntimeError, match="Not authorized"):
+        mailer.send_report(pdf, "s", "b", env=env, run=bad, platform="darwin")
+    with pytest.raises(mailer.NotConfigured, match="macOS"):
+        mailer.send_report(pdf, "s", "b", env=env, run=fake_run, platform="linux")
+    with pytest.raises(mailer.NotConfigured, match="EQR_EMAIL_TO"):
+        mailer.send_report(pdf, "s", "b", env={"EQR_EMAIL_METHOD": "macos-mail"}, run=fake_run, platform="darwin")

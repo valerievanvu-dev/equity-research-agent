@@ -41,7 +41,16 @@ export EQR_SMTP_PASSWORD="app-password"       # for Gmail: an App Password, not 
 # optional: EQR_SMTP_HOST (default smtp.gmail.com), EQR_SMTP_PORT (default 587), EQR_EMAIL_FROM
 ```
 
-If these are unset the run still succeeds and prints `email skipped`. Use `--no-email` to build the PDF without sending.
+**If your provider blocks App Passwords** (common on managed Google Workspace accounts), send through the Mail app
+on your Mac instead. No password is stored anywhere; the first run asks macOS to let Terminal control Mail:
+
+```bash
+export EQR_EMAIL_TO="you@example.com"
+export EQR_EMAIL_METHOD="macos-mail"
+# optional: EQR_EMAIL_FROM="address of the Mail account to send from"
+```
+
+If email is not configured the run still succeeds and prints `email skipped`. Use `--no-email` to build the PDF without sending.
 
 ## Setup
 
