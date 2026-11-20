@@ -629,3 +629,84 @@ def test_unresolvable_derived_ids_do_not_become_references():
     assert refs.cite(["calc:valuation:X:1"]) == [1]
     assert refs.cite(["calc:valuation:UNKNOWN:9", "edgar:comps:UNKNOWN:9"]) == []   # silently dropped
     assert [i["label"] for i in refs.items] == ["p.example"]
+
+
+# ------------------------------------------------------------------ OpenAI Agents SDK engine
+def _valid_note_json():
+    return ResearchNote(ticker="AAA", company="A", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[],
+                        key_risks=[]).model_dump_json()
+
+
+def test_sdk_tools_mirror_ours_and_report_errors_to_the_model():
+    import asyncio
+    import json as _json
+    from eqr.sdk_engine import RunState, make_tools
+    from eqr.tools import TOOLS
+
+    state = RunState()
+    tools = {t.name: t for t in make_tools(state)}
+    assert set(tools) == {t["name"] for t in TOOLS}                                   # one definition of each tool
+    assert tools["get_comps"].params_json_schema == next(t for t in TOOLS if t["name"] == "get_comps")["input_schema"]
+    ok = asyncio.run(tools["calculator"].on_invoke_tool(None, '{"expression": "6*7"}'))
+    assert _json.loads(ok)["result"] == 42
+    bad = asyncio.run(tools["calculator"].on_invoke_tool(None, '{"expression": "__import__(1)"}'))
+    assert bad.startswith("ERROR: ")                                                    # errors are observations, not crashes
+    assert [c["is_error"] for c in state.tool_log] == [False, True]
+
+
+def test_sdk_submit_note_validates_and_finish_rule_waits_for_acceptance():
+    import asyncio
+    from eqr.sdk_engine import RunState, finish_when_note_accepted, make_tools
+
+    state = RunState()
+    submit = {t.name: t for t in make_tools(state)}["submit_note"]
+    behavior = finish_when_note_accepted(state)
+    msg = asyncio.run(submit.on_invoke_tool(None, '{"ticker": "AAA"}'))                # invalid: missing fields
+    assert msg.startswith("ERROR: Invalid note") and state.note is None
+    assert behavior(None, []).is_final_output is False                                  # model gets to repair
+    assert asyncio.run(submit.on_invoke_tool(None, _valid_note_json())) == "Note accepted."
+    assert state.note.ticker == "AAA" and behavior(None, []).is_final_output is True
+
+
+def test_sdk_items_convert_to_canonical_trace_the_rest_of_the_project_reads():
+    import json as _json
+    from types import SimpleNamespace as NS
+    from eqr.citations import tool_calls
+    from eqr.sdk_engine import items_to_messages
+
+    items = [
+        NS(type="reasoning_item", raw_item=NS()),                                       # ignored
+        NS(type="message_output_item", raw_item=NS(content=[NS(type="output_text", text="Checking.")])),
+        NS(type="tool_call_item", raw_item=NS(call_id="c1", name="calculator", arguments='{"expression": "1+1"}')),
+        NS(type="tool_call_output_item", raw_item={"call_id": "c1", "output": _json.dumps({"result": 2})}),
+        NS(type="tool_call_item", raw_item=NS(call_id="c2", name="get_comps", arguments="{oops")),
+        NS(type="tool_call_output_item", raw_item={"call_id": "c2", "output": "ERROR: ValueError: bad"}),
+    ]
+    msgs = items_to_messages("task", items)
+    assert [m["role"] for m in msgs] == ["user", "assistant", "user", "assistant", "user"]
+    assert msgs[1]["content"][0] == {"type": "text", "text": "Checking."}
+    assert msgs[1]["content"][1]["input"] == {"expression": "1+1"}
+    assert "_unparseable_arguments" in msgs[3]["content"][0]["input"]
+    assert [b["is_error"] for b in msgs[2]["content"] + msgs[4]["content"]] == [False, True]
+    assert [(n, r) for n, _i, r in tool_calls({"messages": msgs})] == [("calculator", {"result": 2})]   # errors skipped
+
+
+def test_engine_dispatch_sdk_for_openai_models_loop_for_claude(monkeypatch):
+    import eqr.agent as agent
+    import eqr.sdk_engine as sdk
+
+    called = {}
+    monkeypatch.setattr(sdk, "run_sdk", lambda task, **kw: called.setdefault("sdk", kw["model"]) or "sdk-result")
+    assert agent.run("t", ticker="X", model="gpt-5.5", trace_dir=None) == "gpt-5.5"      # default engine is the SDK
+    assert called["sdk"] == "gpt-5.5"
+
+    class Boom(Exception):
+        pass
+
+    def fake_backend(model):
+        raise Boom(model)
+    monkeypatch.setattr(agent, "get_backend", fake_backend)
+    with pytest.raises(Boom):                                                            # claude models skip the SDK
+        agent.run("t", ticker="X", model="claude-sonnet-5-5", trace_dir=None)
+    with pytest.raises(Boom):                                                            # and --engine loop forces the loop
+        agent.run("t", ticker="X", model="gpt-5.5", engine="loop", trace_dir=None)
