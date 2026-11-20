@@ -1012,3 +1012,160 @@ def test_market_cap_extraction_is_verified_against_the_quote():
         {"market_cap_usd": 138.2e9, "url": "https://f.com/ul", "quote": "Market Cap 138.2B"},
         {"market_cap_usd": 200.0e9, "url": "https://g.com/ul", "quote": "Market Cap 200.0B"}]))
     assert split["market_cap_usd"] is None and "mcap_conflict" in split["flags"]
+
+
+# ------------------------------------------------------------------ Buy screener
+def _vrow(t, pe=None, ebit=None, evs=None, fcf=None, nd=None, oi=None, withheld=False, flags=None):
+    m = {k: {"value": v} for k, v in (("pe", pe), ("ev_ebit", ebit), ("ev_sales", evs), ("fcf_yield_pct", fcf)) if v is not None}
+    return {"ticker": t, "company": t + " Co", "price": 10.0, "withheld": withheld, "flags": flags or [], "metrics": m,
+            "fundamentals": {"net_debt_proxy": nd, "operating_income": oi}}
+
+
+def _crow(t, growth=None, margin=None, stale=False):
+    m = {k: {"value": v} for k, v in (("revenue_growth_pct", growth), ("operating_margin_pct", margin)) if v is not None}
+    return {"ticker": t, "stale": stale, "period_end": "2025-12-31", "metrics": m}
+
+
+def test_pct_rank():
+    from eqr.screen import pct_rank
+
+    vals = [10, 20, 30]
+    assert [pct_rank(x, vals, True) for x in (10, 20, 30)] == [0.0, 0.5, 1.0]
+    assert [pct_rank(x, vals, False) for x in (10, 20, 30)] == [1.0, 0.5, 0.0]          # lower is better (cheapness)
+    assert pct_rank(None, vals) is None and pct_rank(5, [5]) == 0.5 and pct_rank(5, [None, 5]) == 0.5
+    assert pct_rank(20, [20, 20, 20]) == 0.5                                              # ties share rank
+
+
+def test_resolve_universe():
+    from eqr.screen import resolve_universe
+
+    name, t = resolve_universe(["beauty"])
+    assert name == "beauty" and "ELF" in t and "MO" not in t
+    assert resolve_universe(["tobacco"], exclude=["uvv"])[1] == ["MO", "PM", "TPB"]
+    assert resolve_universe(["mo, pm", "PM", "tpb"]) == ("custom", ["MO", "PM", "TPB"])  # commas, case, duplicates
+
+
+def test_stage1_ranks_by_weighted_percentiles_and_excludes_what_it_cannot_verify():
+    from eqr.screen import stage1
+
+    rows = [
+        _vrow("BEST", pe=8, ebit=7, fcf=9, nd=100, oi=100), _vrow("MID", pe=15, ebit=12, fcf=5, nd=300, oi=100),
+        _vrow("WORST", pe=30, ebit=25, fcf=1, nd=900, oi=100),
+        _vrow("LOSS", evs=3.0, fcf=-2, nd=50, oi=-10),                       # no positive earnings: value from EV/Sales
+        _vrow("HELD", pe=5, withheld=True, flags=["price_conflict"]),
+        _vrow("THIN", pe=9),                                                  # one signal only
+        _vrow("ODD", pe=1.2, ebit=2.3, fcf=25, nd=10, oi=100, flags=["check_outlier:pe=1.2"]),   # an extreme multiple
+    ]
+    crows = [_crow("ODD", 30, 40), _crow("BEST", 12, 30), _crow("MID", 6, 20), _crow("WORST", -3, 8), _crow("LOSS", 5, -5),
+             _crow("HELD", 5, 10), _crow("THIN"), _crow("OLD", 5, 10, stale=True)]
+    val = {"rows": rows + [_vrow("OLD", pe=5, ebit=5, fcf=5, nd=1, oi=10)], "errors": {"GONE": "ValueError: Unknown ticker"}}
+    out = stage1(["BEST", "MID", "WORST", "LOSS", "HELD", "THIN", "OLD", "GONE", "ODD"], valuation_fn=lambda t, d: val,
+                 comps_fn=lambda t, d: {"rows": crows, "errors": {}})
+    by = {r["ticker"]: r for r in out["rows"]}
+    assert out["rows"][0]["ticker"] == "BEST" and out["rows"][0]["score"] == 100.0 and [r["rank"] for r in out["rows"]][:2] == [1, 2]
+    assert by["WORST"]["score"] < by["MID"]["score"] < by["BEST"]["score"]
+    assert "value_from_ev_sales" in by["LOSS"]["notes"] and by["LOSS"]["signals"]["leverage"] is None   # EBIT <= 0: not guessed
+    why = dict(out["excluded"])
+    assert "price_conflict" in why["HELD"] and "stale" in why["OLD"] and "only 1 measurable" in why["THIN"]
+    assert "Unknown ticker" in why["GONE"] and out["small_universe"]
+    assert "ODD" not in by and "suspect data" in why["ODD"] and "check_outlier:pe=1.2" in why["ODD"]   # not ranked, not in percentiles
+    kept = stage1(["BEST", "MID", "WORST", "ODD"], valuation_fn=lambda t, d: val, comps_fn=lambda t, d: {"rows": crows, "errors": {}},
+                  include_suspect=True)
+    assert kept["rows"][0]["ticker"] == "ODD" and "BEST" != kept["rows"][0]["ticker"]               # opt-in shows how it distorts
+    assert abs(sum(__import__("eqr.screen", fromlist=["x"]).WEIGHTS.values()) - 1.0) < 1e-9
+
+
+def test_buy_lists_separate_conviction_and_drop_integrity_failures():
+    from eqr.screen import buy_lists
+
+    rs = [{"ticker": "A", "rating": "Buy", "conviction": "Normal", "consistent": 1.0, "expected_total_return_pct": 20},
+          {"ticker": "B", "rating": "Buy", "conviction": "Low", "consistent": 1.0, "expected_total_return_pct": 40},
+          {"ticker": "C", "rating": "Buy", "conviction": "Normal", "consistent": 0.0, "expected_total_return_pct": 90},   # changed rating
+          {"ticker": "D", "rating": "Hold", "conviction": "Normal", "consistent": 1.0},
+          {"ticker": "E", "rating": None, "error": "x"},
+          {"ticker": "F", "rating": "Buy", "conviction": "Normal", "consistent": 1.0, "expected_total_return_pct": 30}]
+    rs.append({"ticker": "G", "rating": "Buy", "conviction": "Low", "consistent": 1.0, "expected_total_return_pct": 318.3})
+    rs.append({"ticker": "H", "rating": "Buy", "conviction": "Normal", "consistent": 1.0, "expected_total_return_pct": 100.0})   # boundary is allowed
+    ok, low, bad, odd = buy_lists(rs)
+    assert [r["ticker"] for r in ok] == ["H", "F", "A"] and [r["ticker"] for r in low] == ["B"]
+    assert [r["ticker"] for r in bad] == ["C"] and [r["ticker"] for r in odd] == ["G"]       # +318%: review by hand, not a Buy
+
+
+def test_stage2_keeps_rank_order_and_survives_a_failed_run():
+    from eqr.screen import stage2
+
+    def run_fn(t):
+        if t == "BAD":
+            raise RuntimeError("boom")
+        return {"ticker": t, "rating": "Hold", "conviction": "Normal", "price_target": 10.0}
+    seen = []
+    out = stage2(["A", "BAD", "C"], run_fn=run_fn, workers=3, progress=seen.append)
+    assert [r["ticker"] for r in out] == ["A", "BAD", "C"] and out[1]["rating"] is None and "boom" in out[1]["error"]
+    assert len(seen) == 3
+
+
+def test_report_and_outputs(tmp_path):
+    from datetime import date
+    from eqr.screen import render_report, write_outputs
+
+    s1 = {"rows": [{"rank": 1, "ticker": "A", "company": "A Co", "score": 77.5, "signals": {k: 0.5 for k in ("value", "fcf_yield", "growth", "quality", "leverage")},
+                    "signals_used": 5, "notes": [], "price": 10.0, "flags": [], "pe": 10, "ev_ebit": 8, "ev_sales": 1, "fcf_yield": 5, "growth": 4, "quality": 20, "leverage": 1.0}],
+          "excluded": [("Z", "no data")], "small_universe": True}
+    res = [{"ticker": "A", "rating": "Buy", "conviction": "Low", "consistent": 1.0, "price_target": 12.0, "current_price": 10.0,
+            "expected_total_return_pct": 20.0, "method": "pe", "flags": ["few_peers"], "pdf": "reports/A.pdf"}]
+    text = render_report("beauty", s1, res, date(2026, 11, 19), 1)
+    assert "Research leads, not advice" in text and "percentiles are coarse" in text and "**Z**: no data" in text
+    assert "Buys with LOW conviction" in text and "- none with normal conviction" in text
+    assert "hidden by --hide-low-conviction" in render_report("beauty", s1, res, date(2026, 11, 19), 1, hide_low=True)
+    md, csv_path = write_outputs("beauty", s1, res, date(2026, 11, 19), 1, False, out_dir=tmp_path)
+    assert md.name == "screen-beauty-2026-11-19.md" and csv_path.read_text().splitlines()[0].startswith("rank,ticker,company,score,value")
+
+
+def test_ratings_history_and_recent_run_reuse(tmp_path):
+    import json as _json
+    import os
+    import time
+    from datetime import date
+    from eqr.history import log_rating
+    from eqr.screen import find_recent_run
+
+    log = tmp_path / "h.jsonl"
+    assert log_rating(_rec_note(), {"run_id": "r1", "engine": "sdk", "model": "m"}, path=log, today=date(2026, 11, 19)) is True
+    row = _json.loads(log.read_text())
+    assert row["ticker"] == "AAA" and row["rating"] == "Buy" and row["run_id"] == "r1" and row["date"] == "2026-11-19"
+    plain = ResearchNote(ticker="A", company="A", summary="s", thesis="t", metrics=[], bull_case=[], bear_case=[], key_risks=[])
+    assert log_rating(plain, {}, path=log) is False and len(log.read_text().splitlines()) == 1
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    fresh, old, nonote = runs / "20261119-1-AAA-x.json", runs / "20261118-1-AAA-y.json", runs / "20261119-2-AAA-z.json"
+    fresh.write_text(_json.dumps({"note": {"ticker": "AAA"}, "run_id": "fresh"}))
+    old.write_text(_json.dumps({"note": {"ticker": "AAA"}, "run_id": "old"}))
+    nonote.write_text(_json.dumps({"note": None, "run_id": "nonote"}))
+    now = time.time()
+    os.utime(old, (now - 72 * 3600,) * 2)
+    os.utime(fresh, (now - 3600,) * 2)
+    os.utime(nonote, (now - 60,) * 2)                                     # newest, but has no note: skipped
+    assert find_recent_run("AAA", 24, runs)["run_id"] == "fresh"          # old one is outside the window
+    assert find_recent_run("AAA", 0.0001, runs) is None and find_recent_run("ZZZ", 24, runs) is None
+
+
+def test_run_one_writes_outputs_summarizes_and_logs(tmp_path, monkeypatch):
+    from pathlib import Path
+    import eqr.agent as agent
+    import eqr.pdf as pdf
+    from eqr.runresult import RunResult
+    from eqr.screen import run_one
+
+    monkeypatch.chdir(tmp_path)
+    trace = {**_target_trace(), "run_id": "r9", "engine": "sdk", "model": "m", "trace_url": "https://t/9", "error": None,
+             "note": _rec_note().model_dump()}
+    monkeypatch.setattr(agent, "run", lambda task, **kw: RunResult(note=_rec_note(), trace=trace))
+    def fake_pdf(note, tr, path, **kw):
+        Path(path).write_bytes(b"%PDF")
+        return Path(path)
+    monkeypatch.setattr(pdf, "build_pdf", fake_pdf)
+    out = run_one("AAA", universe="beauty")
+    assert out["rating"] == "Buy" and out["consistent"] == 1.0 and out["conviction"] == "Normal" and out["trace_url"] == "https://t/9"
+    assert Path(out["pdf"]).exists() and Path(out["md"]).exists()
+    assert (tmp_path / "data" / "ratings_history.jsonl").read_text().count("\n") == 1
