@@ -107,6 +107,14 @@ Companies like Unilever (UL) file a 20-F with IFRS figures in their own currency
   has a `Ccy` column). Valuation converts the financials to USD at the **ECB reference rate** (free Frankfurter API,
   cached, no scraping) so a USD ADR price is never divided by euro earnings. The rate is cited like any source and
   flagged `converted_at_spot:EURUSD=...`.
+- **Market-cap cross-check (all rows):** price x SEC shares is compared with a market cap that was itself
+  **quote-verified** (a dedicated lookup). If *any* verified source agrees within 10% the row passes (sources that
+  disagree with each other are flagged `market_cap_sources_disagree`); if every verified source disagrees the row is
+  withheld (`market_cap_mismatch`); if none can be verified a domestic row is kept and flagged `market_cap_unverified`.
+  The market cap printed on a price page is never used: it is unverified, and pages disagree (NVDA showed $3.03T and
+  $3.99T for the same price).
+- **One snapshot per run:** price and market-cap lookups are remembered for 15 minutes (`EQR_QUOTE_MEMO_SECONDS`, 0
+  disables), so `get_valuation` and `get_price_target` always see the same quote and cannot reach opposite verdicts.
 - **ADR ratio guard:** the share count is for ordinary shares while the US price is per ADS. A foreign row is only
   valued if a quote-verified **market cap** (a dedicated lookup) agrees with price x shares within 10%; otherwise it
   is withheld (`adr_ratio_unverified` or `market_cap_mismatch`).
