@@ -262,15 +262,17 @@ def test_valuation_math_and_withholding(monkeypatch):
     prices_by = {"GOOD": good, "LOSS": good, "BADCAP": {**good, "market_cap_reported": 900.0},
                  "CONF": {**good, "flags": ["price_conflict"], "usable": False}}
     monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
+    verified = {"GOOD": _mcap(300.0), "LOSS": _mcap(300.0), "BADCAP": _mcap(900.0), "CONF": _mcap(300.0)}
     out = v.get_valuation(list(prices_by), date(2026, 11, 19), price_fn=lambda t, n, d: prices_by[t],
-                          shares_fn=shares_fn, comps_fn=comps_fn)
+                          shares_fn=shares_fn, comps_fn=comps_fn, mcap_fn=lambda t, n, d: verified[t](t, n, d))
     rows = {r["ticker"]: r for r in out["rows"]}
     m = rows["GOOD"]["metrics"]
     assert m["market_cap"]["value"] == 300 and m["enterprise_value"]["value"] == 500
     assert m["ev_sales"]["value"] == 0.5 and m["ev_ebit"]["value"] == 5.0 and m["pe"]["value"] == 15.0
     assert m["fcf_yield_pct"]["value"] == pytest.approx(16.67, abs=0.01)
     assert "pe" not in rows["LOSS"]["metrics"] and "ev_sales" in rows["LOSS"]["metrics"]  # negative EPS -> n/m
-    assert rows["BADCAP"]["withheld"] and not rows["BADCAP"]["metrics"]
+    assert rows["BADCAP"]["withheld"] and not rows["BADCAP"]["metrics"]      # verified cap 900 vs implied 300
+    assert any(f.startswith("market_cap_mismatch:implied=300,verified=900") for f in rows["BADCAP"]["flags"])
     assert rows["CONF"]["withheld"]
     assert out["medians"]["ev_sales"]["n"] == 2  # only GOOD and LOSS contribute
     assert {"web:https://a", "edgar:rev", "edgar:shares:GOOD"} <= collect_sources(out)
@@ -878,6 +880,14 @@ def _fx_ok(base, quote, on=None):
     return {"pair": "EURUSD", "rate": 1.2, "date": "2026-11-19", "source": "fx:ecb:EURUSD:2026-11-19", "url": "u"}
 
 
+def _mcap(*values, flags=None):
+    """A quote-verified market-cap lookup result with these values (what prices.get_market_cap returns)."""
+    vals = [float(v) for v in values]
+    mid = sorted(vals)[len(vals) // 2] if vals else None
+    return lambda *a, **k: {"market_cap_usd": mid, "values": vals, "sources": ["web:https://mc.example/x"] if vals else [],
+                            "flags": flags or []}
+
+
 def _no_mcap(*a, **k):
     return {"market_cap_usd": None, "sources": [], "flags": ["mcap_not_verified"]}
 
@@ -894,7 +904,7 @@ def test_valuation_converts_foreign_financials_to_usd_at_spot(monkeypatch):
     monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
     shares = lambda t: {"shares": 100.0, "as_of": "2025-12-31", "multi_class": False, "basis": "cover_page", "source": "edgar:shares:F"}
     out = v.get_valuation(["F"], date(2026, 11, 19), price_fn=lambda t, n, d: _usd_price(), shares_fn=shares,
-                          comps_fn=_eur_comps, fx_fn=_fx_ok, mcap_fn=_no_mcap)
+                          comps_fn=_eur_comps, fx_fn=_fx_ok, mcap_fn=_mcap(2400.0))
     row = out["rows"][0]
     m = row["metrics"]
     # EPS 2.0 EUR -> 2.4 USD, so P/E = 24 / 2.4 = 10.0 (a naive 24 / 2.0 = 12.0 would be wrong by the exchange rate)
@@ -919,7 +929,7 @@ def test_foreign_valuation_is_withheld_when_it_cannot_be_verified(monkeypatch):
 
     no_cap = run(_usd_price(mcap=None))                                         # cannot verify the ADR-to-share ratio
     assert no_cap["withheld"] and "adr_ratio_unverified" in no_cap["flags"] and not no_cap["metrics"]
-    adr2 = run(_usd_price(mcap=4800.0))                                         # page says 2x: one ADR = 0.5 shares, etc.
+    adr2 = run(_usd_price(mcap=None), mcap_fn=_mcap(4800.0))                    # verified cap says 2x: ADR ratio is not 1
     assert adr2["withheld"] and any(f.startswith("market_cap_mismatch") for f in adr2["flags"])
 
     def boom(*a, **k):
@@ -1219,3 +1229,71 @@ def test_price_and_market_cap_lookups_keep_their_own_15_minute_expiry():
     prices.get_price("X", "X Co", date(2026, 11, 19), search=spy)
     prices.get_market_cap("X", "X Co", date(2026, 11, 19), search=spy)
     assert seen == [900, 900]
+
+
+def test_market_cap_cross_check_uses_only_verified_values(monkeypatch):
+    from datetime import date
+    from eqr import valuation as v
+
+    monkeypatch.setattr(v.edgar, "lookup", lambda t: (1, t))
+
+    price = {"price": 165.05, "as_of": "2026-11-23", "market_cap_reported": 1.0,       # absurd page-printed cap: must be ignored
+             "sources": ["web:https://p.example/nvda"], "flags": [], "usable": True}
+    comps_fn = lambda t, today: {"company": t, "period_end": "2026-01-25", "stale": False, "flags": [], "metrics": {
+        "revenue": {"value": 1e11, "unit": "USD", "sources": ["edgar:rev"]}, "eps_diluted": {"value": 4.0, "unit": "USD/shares", "sources": ["edgar:eps"]}}}
+    shares = lambda t: {"shares": 24.1e9, "as_of": "2026-08-21", "multi_class": False, "basis": "cover_page", "source": "edgar:shares"}
+    implied = 165.05 * 24.1e9                                                           # about 3.978 trillion
+    cases = {"NVDALIKE": _mcap(3.03e12, 3.99e12, flags=["mcap_conflict"]),             # sources disagree, one matches ours
+             "WRONG": _mcap(3.03e12, 2.90e12),                                          # nothing verified agrees with ours
+             "NOCAP": _mcap()}                                                          # no verified market cap at all
+    out = v.get_valuation(list(cases), date(2026, 11, 24), price_fn=lambda t, n, d: price, shares_fn=shares, comps_fn=comps_fn,
+                          mcap_fn=lambda t, n, d: cases[t](t, n, d))
+    rows = {r["ticker"]: r for r in out["rows"]}
+    assert abs(implied / 3.99e12 - 1) < 0.01
+    assert not rows["NVDALIKE"]["withheld"] and "market_cap_sources_disagree" in rows["NVDALIKE"]["flags"]
+    assert rows["NVDALIKE"]["metrics"]["pe"]["value"] == round(165.05 / 4.0, 2)
+    assert rows["WRONG"]["withheld"] and any(f.startswith("market_cap_mismatch") and "verified=3,030,000,000,000" in f for f in rows["WRONG"]["flags"])
+    assert not rows["NOCAP"]["withheld"] and "market_cap_unverified" in rows["NOCAP"]["flags"]   # domestic: kept, flagged
+
+
+def test_quote_snapshot_is_remembered_so_every_tool_sees_the_same_price(tmp_path, monkeypatch):
+    import json as _json
+    from datetime import date
+    from eqr import prices, web
+
+    monkeypatch.setattr(web, "CACHE_DIR", tmp_path / "web")
+    monkeypatch.delenv("EQR_QUOTE_MEMO_SECONDS", raising=False)
+    n = {"calls": 0}
+
+    def impl(ticker, company, today=None, **kw):
+        n["calls"] += 1
+        return {"ticker": ticker, "price": 100.0 + n["calls"], "usable": True}   # a different answer each time it is really run
+    monkeypatch.setattr(prices, "_get_price_impl", impl)
+    d = date(2026, 11, 24)
+    first = prices.get_price("NVDA", "NVIDIA", d)
+    again = prices.get_price("NVDA", "NVIDIA", d)                                  # e.g. get_price_target seconds later
+    assert first == again and n["calls"] == 1
+    assert prices.get_price("NVDA", "NVIDIA", date(2026, 11, 25))["price"] == 102.0   # a different day is never reused
+    assert prices.get_price("AMD", "AMD", d)["price"] == 103.0                          # per ticker
+    prices.get_price("NVDA", "NVIDIA", d, search=lambda **kw: {"results": []})         # injected fakes (tests) bypass the memo
+    assert n["calls"] == 4
+    monkeypatch.setenv("EQR_QUOTE_MEMO_SECONDS", "0")
+    prices.get_price("NVDA", "NVIDIA", d)
+    assert n["calls"] == 5                                                              # memo disabled: really runs again
+    monkeypatch.delenv("EQR_QUOTE_MEMO_SECONDS")
+    (tmp_path / "quotes" / "price-NVDA.json").write_text("{not json")                  # a corrupt memo is only a miss
+    assert prices.get_price("NVDA", "NVIDIA", d)["price"] == 106.0 and n["calls"] == 6
+
+
+def test_market_cap_lookup_exposes_every_verified_value():
+    import json as _json
+    from datetime import date
+    from eqr import prices
+
+    pages = lambda **kw: {"results": [{"url": "https://f.com/n", "title": "", "publish_date": None, "excerpts": ["Market Cap 3.03T"]},
+                                      {"url": "https://g.com/n", "title": "", "publish_date": None, "excerpts": ["Market Cap 3.99T"]}]}
+    ext = lambda m, s, u: _json.dumps({"candidates": [
+        {"market_cap_usd": 3.03e12, "url": "https://f.com/n", "quote": "Market Cap 3.03T"},
+        {"market_cap_usd": 3.99e12, "url": "https://g.com/n", "quote": "Market Cap 3.99T"}]})
+    r = prices._get_market_cap_impl("NVDA", "NVIDIA", date(2026, 11, 24), search=pages, extract=ext)
+    assert r["market_cap_usd"] is None and "mcap_conflict" in r["flags"] and r["values"] == [3.03e12, 3.99e12]

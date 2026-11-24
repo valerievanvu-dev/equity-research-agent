@@ -3,8 +3,9 @@
 Honest limits, returned with every result:
 - Multiples use the latest FISCAL YEAR, not LTM, so they lag for companies with older year-ends.
 - EV = market cap + net_debt_proxy (long-term debt - cash). Excludes current debt, leases, minorities, preferred.
-- Price comes from web pages. A row whose price is conflicting/stale/unverified or whose implied market cap
-  disagrees with the page's market cap by >10% has its multiples withheld and is excluded from medians.
+- Price comes from web pages. A row whose price is conflicting/stale/unverified, or whose implied market cap
+  (price x SEC shares) disagrees by >10% with EVERY quote-verified market cap found, has its multiples withheld and is
+  excluded from medians. The market cap printed on a price page is NOT used: it is unverified and pages disagree.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ NOTES = [
     "Multiples use the latest fiscal year (not LTM); companies with older year-ends are less current.",
     "EV = market cap + net_debt_proxy (long-term debt - cash); excludes current debt, leases and minorities.",
     "Prices come from web search with verbatim-quote verification; check `flags` before relying on a row.",
+    "Price x SEC shares is cross-checked against a quote-verified market cap; market_cap_unverified means that check could not run.",
     "debt_assumed_zero: no long-term-debt tag in any year, so net debt = -cash; excluded from EV-multiple medians.",
     "check_outlier flags extreme multiples (often one-off items in the fiscal year): inspect before relying on them.",
     "n/m means not meaningful (negative or zero earnings). Withheld rows are excluded from medians.",
@@ -39,8 +41,7 @@ def _to_usd(m: dict, ccy: str, rate: float) -> dict:
     return out
 
 
-def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn, fx_fn=fx.get_rate,
-         mcap_fn=prices.get_market_cap) -> dict:
+def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn, fx_fn=fx.get_rate, mc: dict | None = None) -> dict:
     c = comps_fn(ticker, today)
     m = c["metrics"]
     ccy = c.get("currency", "USD")
@@ -79,22 +80,28 @@ def _row(ticker: str, today: date, price: dict, shares_fn, comps_fn, fx_fn=fx.ge
             srcs.add(rate["source"])
 
     mcap = price["price"] * sh["shares"]
-    rep = price["market_cap_reported"]
-    if ccy != "USD" and not rep and mcap_fn:  # a dedicated, quote-verified market cap lookup, to check the ADR ratio
-        mc = mcap_fn(ticker, c["company"], today)
-        rep = mc.get("market_cap_usd")
-        srcs.update(mc.get("sources", []))
-        flags.extend(mc.get("flags", []))
-    if ccy != "USD" and not rep:  # without a market cap we cannot verify the ADR-to-share ratio
+    # Cross-check price x SEC shares (this catches share-count and ADR-ratio errors) against a market cap that was itself
+    # quote-verified. If ANY verified source agrees, the row passes; sources that disagree with each other are flagged.
+    mc = mc or {}
+    srcs.update(mc.get("sources", []))
+    flags.extend(mc.get("flags", []))
+    vals = mc.get("values") or ([mc["market_cap_usd"]] if mc.get("market_cap_usd") else [])
+    if any(abs(mcap / v - 1) <= MCAP_TOL for v in vals):
+        if max(vals) / min(vals) - 1 > MCAP_TOL:
+            flags.append("market_cap_sources_disagree")
+    elif vals:
+        closest = min(vals, key=lambda v: abs(v / mcap - 1))
+        flags.append(f"market_cap_mismatch:implied={mcap:,.0f},verified={closest:,.0f}")
+        row["withheld"] = True
+        row["sources"] = sorted(srcs)
+        return row
+    elif ccy != "USD":  # no verified market cap: the ADR-to-share ratio cannot be confirmed
         flags.append("adr_ratio_unverified")
         row["withheld"] = True
         row["sources"] = sorted(srcs)
         return row
-    if rep and abs(mcap / rep - 1) > MCAP_TOL:
-        flags.append(f"market_cap_mismatch:implied={mcap:,.0f},page={rep:,.0f}")
-        row["withheld"] = True
-        row["sources"] = sorted(srcs)
-        return row
+    else:
+        flags.append("market_cap_unverified")  # domestic row: keep it, but say the cross-check could not run
 
     def put(name, value, unit, inputs):
         if value is not None:
@@ -146,12 +153,17 @@ def get_valuation(tickers: list[str], today: date | None = None, *, price_fn=pri
             names[t] = edgar.lookup(t)[1]
         except Exception as e:
             errors[t.upper()] = f"{type(e).__name__}: {e}"
-    with ThreadPoolExecutor(4) as ex:  # prices are network-bound and independent
+    with ThreadPoolExecutor(4) as ex:  # prices and market caps are network-bound and independent
         price_futs = {t: ex.submit(price_fn, t, names[t], today) for t in names}
+        mcap_futs = {t: ex.submit(mcap_fn, t, names[t], today) for t in names} if mcap_fn else {}
     rows = []
     for t in names:
         try:
-            rows.append(_row(t, today, price_futs[t].result(), shares_fn, comps_fn, fx_fn, mcap_fn))
+            try:
+                mc = mcap_futs[t].result() if t in mcap_futs else None
+            except Exception as e:  # a failed market-cap lookup weakens the cross-check, it does not blank the row
+                mc = {"flags": [f"mcap_lookup_error:{type(e).__name__}"]}
+            rows.append(_row(t, today, price_futs[t].result(), shares_fn, comps_fn, fx_fn, mc))
         except Exception as e:
             errors[t.upper()] = f"{type(e).__name__}: {e}"
     medians = {}

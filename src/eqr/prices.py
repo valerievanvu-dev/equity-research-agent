@@ -16,6 +16,7 @@ import json
 import os
 import re
 import statistics as st
+import time
 from datetime import date
 
 from . import web
@@ -51,8 +52,8 @@ def verified(cand: dict, corpus: str, urls: set[str]) -> bool:
     return any(f in quote for f in {f"{price:,.2f}", f"{price:.2f}", f"{price:g}"})
 
 
-def get_price(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
-              extract=complete_json) -> dict:
+def _get_price_impl(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
+                    extract=complete_json) -> dict:
     today = today or date.today()
     res = search(
         objective=f"Current stock price of {company} ({ticker.upper()}) in USD, with the date of the quote",
@@ -169,11 +170,11 @@ def mcap_verified(cand: dict, corpus: str, urls: set[str]) -> bool:
     return any(abs(n / value - 1) <= MCAP_QUOTE_TOL for n in _numbers_in(quote))  # the number must really be in the quote
 
 
-def get_market_cap(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
-                   extract=complete_json) -> dict:
+def _get_market_cap_impl(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
+                         extract=complete_json) -> dict:
     """Verified USD market cap from web quotes, or None. Used to confirm price x shares (the ADR-to-share ratio)."""
     today = today or date.today()
-    out: dict = {"market_cap_usd": None, "sources": [], "flags": []}
+    out: dict = {"market_cap_usd": None, "values": [], "sources": [], "flags": []}
     res = search(objective=f"Current market capitalization of {company} ({ticker.upper()}) in USD",
                  search_queries=[f"{ticker.upper()} market cap", f"{company} {ticker.upper()} market capitalization"],
                  mode="fast", max_results=6, max_chars_total=12000, include_domains=FIN_DOMAINS,
@@ -197,9 +198,57 @@ def get_market_cap(ticker: str, company: str, today: date | None = None, *, sear
         out["flags"].append("mcap_not_verified")
         return out
     vals = [float(c["market_cap_usd"]) for c in good]
+    out["values"] = sorted(vals)
     mid = st.median(vals)
     if (max(vals) - min(vals)) / mid > MCAP_CONFLICT_TOL:
         out["flags"].append("mcap_conflict")
         return out
     out["market_cap_usd"], out["sources"] = mid, sorted({f"web:{c['url']}" for c in good})
     return out
+
+
+# ------------------------------------------------------------------ one snapshot per ticker (shared by every tool)
+def _memo_ttl_s() -> float:
+    return float(os.environ.get("EQR_QUOTE_MEMO_SECONDS", "900"))  # 0 disables
+
+
+def _memoized(kind: str, ticker: str, today: date, compute, enabled: bool) -> dict:
+    """Remember the verified lookup result for a few minutes so every tool in a run sees the SAME price and market cap.
+
+    The search is cached, but the model's extraction from it is not deterministic: without this, get_valuation and
+    get_price_target (seconds apart) could extract different quotes for the same ticker and reach opposite verdicts.
+    """
+    ttl = _memo_ttl_s()
+    if not enabled or ttl <= 0:
+        return compute()
+    path = web.CACHE_DIR.parent / "quotes" / f"{kind}-{ticker.upper()}.json"
+    try:
+        if path.exists() and time.time() - path.stat().st_mtime < ttl:
+            saved = json.loads(path.read_text())
+            if saved.get("date") == today.isoformat():
+                return saved["result"]
+    except (OSError, ValueError, KeyError):
+        pass  # a corrupt memo is just a miss
+    result = compute()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"date": today.isoformat(), "result": result}))
+        tmp.replace(path)  # atomic: parallel threads never see a half-written file
+    except OSError:
+        pass
+    return result
+
+
+def get_price(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
+              extract=complete_json) -> dict:
+    today = today or date.today()
+    live = search is web.web_search and extract is complete_json  # injected fakes (tests) are never memoized
+    return _memoized("price", ticker, today, lambda: _get_price_impl(ticker, company, today, search=search, extract=extract), live)
+
+
+def get_market_cap(ticker: str, company: str, today: date | None = None, *, search=web.web_search,
+                   extract=complete_json) -> dict:
+    today = today or date.today()
+    live = search is web.web_search and extract is complete_json
+    return _memoized("mcap", ticker, today, lambda: _get_market_cap_impl(ticker, company, today, search=search, extract=extract), live)
